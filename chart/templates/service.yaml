@@ -1,14 +1,12 @@
-# ClusterIP only — MCP servers are reachable from inside the cluster (e.g.
-# tank-operator session pods) and never directly from the internet.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mcp-azure
+  name: mcp-azure-personal
   namespace: mcp-azure
 spec:
   type: ClusterIP
   selector:
-    app: mcp-azure
+    app: mcp-azure-personal
   ports:
     - name: http
       port: 80

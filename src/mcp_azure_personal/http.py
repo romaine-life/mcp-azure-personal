@@ -1,4 +1,4 @@
-"""HTTP entrypoint for the guarded Azure admin MCP server."""
+"""HTTP entrypoint for the personal Azure MCP server."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .tools import register_tools
 
 def build_app() -> Starlette:
     mcp = FastMCP(
-        "azure-admin-mcp",
+        "azure-personal-mcp",
         stateless_http=True,
         streamable_http_path="/",
         transport_security=TransportSecuritySettings(

@@ -6,29 +6,21 @@
 # infra/mcp-server/ for the upstream definitions.
 
 image:
-  # Microsoft's image — no tag-bump CI on our side. Digest-pinned so :latest
-  # drift is impossible; bump by hand when you want a newer version (find the
-  # current digest with `kubectl -n mcp-azure get pod -o jsonpath=...`).
-  repository: mcr.microsoft.com/azure-sdk/azure-mcp
-  digest: sha256:ec43a27ccbd6f7333c010bbe0a3ea7afed4ee761c19e080c5090bc3e2fd6f40e
-  pullPolicy: IfNotPresent
-
-adminImage:
-  repository: romainecr.azurecr.io/mcp-azure-admin
+  repository: romainecr.azurecr.io/mcp-azure-personal
   # SHA-pinned. .github/workflows/build.yml rewrites this tag on every push to main
   # via a `[skip ci]` follow-up commit. Quoted so all-digit short-SHAs don't
   # become floats.
   tag: "23b29a1"
   pullPolicy: IfNotPresent
 
-# Loopback-only port azure-mcp listens on. Sidecar fronts it.
+# Loopback-only port the MCP server listens on. Sidecar fronts it.
 upstreamPort: 8080
 
 subscriptionId: 606a1ca1-5833-4d21-8937-d0fcd97cd0a0
 
 # kube-rbac-proxy sidecar — terminates client connections, calls the K8s
 # API's TokenReview to validate incoming bearer SA tokens, then forwards to
-# azure-mcp on localhost. Plain HTTP (insecure-listen-address) — in-cluster
+# the MCP server on localhost. Plain HTTP (insecure-listen-address) — in-cluster
 # traffic doesn't gain meaningfully from TLS without a service mesh, and
 # avoiding cert plumbing keeps v1 simple.
 proxy:
@@ -44,13 +36,6 @@ resources:
     memory: 128Mi
   limits:
     memory: 512Mi
-
-adminResources:
-  requests:
-    cpu: 50m
-    memory: 128Mi
-  limits:
-    memory: 256Mi
 
 proxyResources:
   requests:

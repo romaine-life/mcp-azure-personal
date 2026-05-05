@@ -1,11 +1,3 @@
-# kube-rbac-proxy needs a config file telling it what SubjectAccessReview
-# attributes to authorize against. Without a config it defaults to empty
-# (verb=get, resource="") which nothing has permission for, so every call
-# gets 403. We invent a synthetic resource — mcp.tank-operator.io/servers
-# named "azure" in this namespace — and gate access via a ClusterRole +
-# RoleBinding granting "invoke" on it. The CRD doesn't exist; K8s RBAC
-# happily authorizes any apiGroup/resource/verb tuple as long as a Role
-# allows it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -17,38 +9,28 @@ data:
       resourceAttributes:
         apiGroup: mcp.tank-operator.io
         resource: servers
-        name: azure
+        name: azure-personal
         namespace: mcp-azure
-        # verb omitted — kube-rbac-proxy v0.18 auto-maps the HTTP method
-        # (GET → get, POST → create, etc.) and an explicit verb field
-        # here is ignored. ClusterRole grants both verbs that MCP traffic
-        # uses.
 ---
-# Permission to "invoke" the mcp-azure server. ClusterRole because the
-# SAs that need it live in other namespaces (e.g. claude-session in
-# tank-operator-sessions); RoleBinding scopes it to mcp-azure ns to
-# match the resourceAttributes above.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: mcp-azure-invoker
+  name: mcp-azure-personal-invoker
 rules:
   - apiGroups: ["mcp.tank-operator.io"]
     resources: ["servers"]
-    resourceNames: ["azure"]
-    # MCP traffic over HTTP is GET (SSE) + POST (JSON-RPC). kube-rbac-proxy
-    # maps each method to the matching K8s RBAC verb.
+    resourceNames: ["azure-personal"]
     verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: mcp-azure-invoker
+  name: mcp-azure-personal-invoker
   namespace: mcp-azure
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: mcp-azure-invoker
+  name: mcp-azure-personal-invoker
 subjects:
   - kind: ServiceAccount
     name: claude-session

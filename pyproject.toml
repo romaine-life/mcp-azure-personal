@@ -1,9 +1,10 @@
 [project]
-name = "mcp-azure-admin"
+name = "mcp-azure-personal"
 version = "0.1.0"
-description = "Guarded destructive Azure cleanup tools for tank-operator sessions."
+description = "Personal Azure MCP tools for tank-operator sessions."
 requires-python = ">=3.10"
 dependencies = [
+    "azure-cosmos>=4.7",
     "azure-identity>=1.25.1",
     "mcp>=1.18.0",
     "requests>=2.32.0",
@@ -16,7 +17,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mcp_azure_admin"]
+packages = ["src/mcp_azure_personal"]
 
 [project.scripts]
-mcp-azure-admin-http = "mcp_azure_admin.http:main"
+mcp-azure-personal-http = "mcp_azure_personal.http:main"

@@ -1,4 +1,4 @@
 apiVersion: v2
 name: mcp-azure
 version: 0.2.0
-description: Azure MCP Server in HTTP mode. Upstream Azure auth via the pod's UAMI (workload identity); incoming auth via kube-rbac-proxy sidecar that validates K8s SA tokens.
+description: First-party Azure MCP server in HTTP mode. Upstream Azure auth via the pod's UAMI (workload identity); incoming auth via kube-rbac-proxy sidecar that validates K8s SA tokens.

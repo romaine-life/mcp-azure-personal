@@ -1,97 +1,46 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mcp-azure
+  name: mcp-azure-personal
   namespace: mcp-azure
 spec:
   replicas: 1
-  # Single-node B2s_v2 cluster has no headroom for the rolling-update default
-  # (maxSurge=1 keeps both old + new alive briefly, which doesn't fit). Recreate
-  # tears down the old pod first, then brings up the new one — brief
-  # unavailability is fine for an internal MCP server with one consumer.
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: mcp-azure
+      app: mcp-azure-personal
   template:
     metadata:
       labels:
-        app: mcp-azure
-        # Triggers the Azure workload-identity webhook to project the SA
-        # token + mount the federated token file. AZURE_CLIENT_ID /
-        # AZURE_TENANT_ID we set ourselves from the ExternalSecret.
+        app: mcp-azure-personal
         azure.workload.identity/use: "true"
     spec:
-      serviceAccountName: mcp-azure
+      serviceAccountName: mcp-azure-personal
       containers:
-        - name: azure-mcp
-          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+        - name: mcp-azure-personal
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          # Image entrypoint is `./server-binary server start` — args here
-          # are flags only.
-          # --outgoing-auth-strategy UseHostingEnvironmentIdentity: server
-          # uses its OWN identity (the federated UAMI) for upstream Azure
-          # calls, not the caller's. This is the inverse of OBO.
-          # --dangerously-disable-http-incoming-auth: skip the server's
-          # built-in Entra JWT validation. kube-rbac-proxy fronts us with
-          # K8s SA token auth instead, and binding 127.0.0.1 means nothing
-          # can reach this listener bypassing the proxy.
-          args:
-            - --transport
-            - http
-            - --outgoing-auth-strategy
-            - UseHostingEnvironmentIdentity
-            - --dangerously-disable-http-incoming-auth
-            # Skip the user-consent (elicitation) prompt before sensitive
-            # commands like KV secret reads. The guard is meant for direct
-            # human-in-the-loop scenarios; here every caller is an in-
-            # cluster claude-session pod authenticated via TokenReview and
-            # the synthetic mcp.tank-operator.io/servers RBAC. Elicitation
-            # only blocks legitimate programmatic use without adding any
-            # security since there's no user to confirm anyway.
-            - --dangerously-disable-elicitation
           ports:
             - name: upstream
               containerPort: {{ .Values.upstreamPort }}
           envFrom:
-            # AZURE_CLIENT_ID + AZURE_TENANT_ID from KV via ExternalSecret.
             - secretRef:
-                name: mcp-azure-config
+                name: mcp-azure-personal-config
           env:
-            # Loopback-only — defense in depth against any caller who knows
-            # the pod IP and tries to bypass the kube-rbac-proxy by hitting
-            # 8080 directly. The disable-incoming-auth path additionally
-            # rejects wildcard hosts (+, *, 0.0.0.0) regardless of
-            # ALLOW_INSECURE_EXTERNAL_BINDING — see ServiceStartCommand.cs
-            # InitializeListingUrls — so localhost is required, not just
-            # preferable.
-            - name: ASPNETCORE_URLS
-              value: http://localhost:{{ .Values.upstreamPort }}
-            # Path the WI webhook projects the federated token to.
+            - name: PORT
+              value: "{{ .Values.upstreamPort }}"
+            - name: AZURE_SUBSCRIPTION_ID
+              value: "{{ .Values.subscriptionId }}"
             - name: AZURE_FEDERATED_TOKEN_FILE
               value: /var/run/secrets/azure/tokens/azure-identity-token
             - name: AZURE_AUTHORITY_HOST
               value: https://login.microsoftonline.com/
-            - name: AZURE_SUBSCRIPTION_ID
-              value: "{{ .Values.subscriptionId }}"
-            # azure-mcp's --outgoing-auth-strategy UseHostingEnvironmentIdentity
-            # docs imply DefaultAzureCredential, but the HTTP transport actually
-            # walks the stdio/local chain (Environment → VS → VSCode → CLI →
-            # PS → AZD → InteractiveBrowser) and never reaches
-            # WorkloadIdentityCredential. Pinning this env var skips the chain
-            # and uses WI directly — matches what the SA + projected token +
-            # AZURE_CLIENT_ID are actually set up for.
-            # Source: https://github.com/microsoft/mcp/blob/main/docs/Authentication.md
             - name: AZURE_TOKEN_CREDENTIALS
               value: WorkloadIdentityCredential
           readinessProbe:
-            # tcpSocket can't target loopback (probes run from the kubelet's
-            # netns and hit the pod IP). exec runs inside the container so
-            # localhost works. nc -z just checks the listener accepts a
-            # TCP connection — equivalent intent to tcpSocket but reachable.
             exec:
-              command: ["nc", "-z", "localhost", "{{ .Values.upstreamPort }}"]
+              command: ["python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', {{ .Values.upstreamPort }})); s.close()"]
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:

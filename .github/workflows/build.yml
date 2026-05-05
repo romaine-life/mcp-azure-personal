@@ -1,4 +1,4 @@
-name: Build mcp-azure-admin image
+name: Build mcp-azure-personal image
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mcp-azure-admin-build
+  group: mcp-azure-personal-build
   cancel-in-progress: true
 
 permissions:
@@ -44,9 +44,9 @@ jobs:
       - name: Build + push
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          docker build -t romainecr.azurecr.io/mcp-azure-admin:$TAG .
-          docker push romainecr.azurecr.io/mcp-azure-admin:$TAG
-          echo "### Pushed romainecr.azurecr.io/mcp-azure-admin:$TAG" >> $GITHUB_STEP_SUMMARY
+          docker build -t romainecr.azurecr.io/mcp-azure-personal:$TAG .
+          docker push romainecr.azurecr.io/mcp-azure-personal:$TAG
+          echo "### Pushed romainecr.azurecr.io/mcp-azure-personal:$TAG" >> $GITHUB_STEP_SUMMARY
 
       - name: Bump chart image tag
         env:
@@ -60,18 +60,18 @@ jobs:
           path = Path("chart/values.yaml")
           tag = os.environ["TAG"]
           lines = path.read_text().splitlines()
-          in_admin_image = False
+          in_image = False
           for i, line in enumerate(lines):
-              if line == "adminImage:":
-                  in_admin_image = True
+              if line == "image:":
+                  in_image = True
                   continue
-              if in_admin_image and line and not line.startswith("  "):
-                  in_admin_image = False
-              if in_admin_image and line.startswith("  tag: "):
+              if in_image and line and not line.startswith("  "):
+                  in_image = False
+              if in_image and line.startswith("  tag: "):
                   lines[i] = f'  tag: "{tag}"'
                   break
           else:
-              raise SystemExit("adminImage.tag not found")
+              raise SystemExit("image.tag not found")
           path.write_text("\n".join(lines) + "\n")
           PY2
 

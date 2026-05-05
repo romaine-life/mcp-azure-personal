@@ -7,4 +7,4 @@ COPY src ./src
 
 RUN pip install --no-cache-dir .
 
-ENTRYPOINT ["mcp-azure-admin-http"]
+ENTRYPOINT ["mcp-azure-personal-http"]
