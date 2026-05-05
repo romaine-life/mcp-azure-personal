@@ -18,7 +18,7 @@ adminImage:
   # SHA-pinned. .github/workflows/build.yml rewrites this tag on every push to main
   # via a `[skip ci]` follow-up commit. Quoted so all-digit short-SHAs don't
   # become floats.
-  tag: "7c7351f"
+  tag: "23b29a1"
   pullPolicy: IfNotPresent
 
 # Loopback-only port azure-mcp listens on. Sidecar fronts it.
