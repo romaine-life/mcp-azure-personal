@@ -22,6 +22,8 @@ from mcp.server.fastmcp import FastMCP
 
 ARM = "https://management.azure.com"
 ARM_SCOPE = "https://management.azure.com/.default"
+GRAPH = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 RESOURCES_API_VERSION = "2021-04-01"
 STATIC_SITE_API_VERSION = "2024-04-01"
 RESOURCE_GROUP_API_VERSION = "2024-11-01"
@@ -54,6 +56,14 @@ def _credential() -> WorkloadIdentityCredential | DefaultAzureCredential:
 
 def _headers() -> dict[str, str]:
     token = _credential().get_token(ARM_SCOPE).token
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _graph_headers() -> dict[str, str]:
+    token = _credential().get_token(GRAPH_SCOPE).token
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -210,6 +220,62 @@ def _request(
     return resp
 
 
+def _graph_request(
+    method: str,
+    path: str,
+    *,
+    ok: set[int],
+    json: dict[str, Any] | None = None,
+) -> requests.Response:
+    resp = requests.request(method, f"{GRAPH}{path}", headers=_graph_headers(), json=json, timeout=30)
+    if resp.status_code not in ok:
+        detail = resp.text.strip()
+        raise RuntimeError(f"Microsoft Graph {method} {path} failed with {resp.status_code}: {detail}")
+    return resp
+
+
+def _graph_filter_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _normalize_redirect_uri(uri: str) -> str:
+    normalized = str(uri or "").strip()
+    if not normalized:
+        raise ValueError("redirect URI must not be empty")
+    if not normalized.startswith("https://") and "localhost" not in normalized:
+        raise ValueError(f"redirect URI must be https unless localhost: {uri!r}")
+    return normalized
+
+
+def _resolve_application(
+    *,
+    application_object_id: str | None = None,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    if application_object_id:
+        return _graph_request(
+            "GET",
+            f"/applications/{application_object_id}",
+            ok={200},
+        ).json()
+    if not display_name:
+        raise ValueError("application_object_id or display_name is required")
+    payload = _graph_request(
+        "GET",
+        "/applications"
+        f"?$filter=displayName eq '{_graph_filter_literal(display_name)}'"
+        "&$select=id,appId,displayName,spa,web,publicClient",
+        ok={200},
+    ).json()
+    items = payload.get("value") or []
+    if not items:
+        raise RuntimeError(f"application not found with display_name={display_name!r}")
+    if len(items) > 1:
+        ids = ", ".join(str(item.get("id")) for item in items)
+        raise RuntimeError(f"display_name={display_name!r} matched multiple applications: {ids}")
+    return items[0]
+
+
 def _resource_path(path: str, subscription: str | None = None) -> str:
     normalized = path if path.startswith("/") else f"/{path}"
     if normalized.startswith("/subscriptions/"):
@@ -344,6 +410,65 @@ def register_tools(mcp: FastMCP) -> None:
             "path": resolved,
             "api_version": api_version,
             "resource": payload,
+        }
+
+    @mcp.tool()
+    def entra_upsert_spa_redirect_uris(
+        redirect_uris: list[str],
+        application_object_id: str | None = None,
+        display_name: str | None = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Add SPA redirect URIs to one Entra app registration.
+
+        Resolve the app by exact `application_object_id` or exact
+        `display_name`. The tool preserves existing SPA redirect URIs and only
+        appends missing values. `dry_run` defaults true; pass false to write.
+
+        Use for native webapp validation hosts whose browser login uses
+        MSAL.js with `redirectUri = window.location.origin + "/"`.
+        """
+        wanted = []
+        seen = set()
+        for uri in redirect_uris:
+            normalized = _normalize_redirect_uri(uri)
+            if normalized not in seen:
+                wanted.append(normalized)
+                seen.add(normalized)
+        if not wanted:
+            raise ValueError("redirect_uris must contain at least one URI")
+
+        app = _resolve_application(
+            application_object_id=application_object_id,
+            display_name=display_name,
+        )
+        app_id = str(app.get("id") or "")
+        current = list(((app.get("spa") or {}).get("redirectUris")) or [])
+        merged = list(current)
+        added = []
+        for uri in wanted:
+            if uri not in merged:
+                merged.append(uri)
+                added.append(uri)
+
+        if not dry_run and added:
+            _graph_request(
+                "PATCH",
+                f"/applications/{app_id}",
+                ok={204},
+                json={"spa": {"redirectUris": merged}},
+            )
+
+        return {
+            "dry_run": dry_run,
+            "application_object_id": app_id,
+            "app_id": app.get("appId"),
+            "display_name": app.get("displayName"),
+            "existing_redirect_uris": current,
+            "requested_redirect_uris": wanted,
+            "added_redirect_uris": added,
+            "redirect_uris": merged,
+            "changed": bool(added),
         }
 
     @mcp.tool()
