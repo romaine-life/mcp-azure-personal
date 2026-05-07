@@ -24,6 +24,8 @@ ARM = "https://management.azure.com"
 ARM_SCOPE = "https://management.azure.com/.default"
 GRAPH = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+KEYVAULT_SCOPE = "https://vault.azure.net/.default"
+KEYVAULT_API_VERSION = "7.4"
 RESOURCES_API_VERSION = "2021-04-01"
 STATIC_SITE_API_VERSION = "2024-04-01"
 RESOURCE_GROUP_API_VERSION = "2024-11-01"
@@ -218,6 +220,46 @@ def _request(
     if resp.status_code not in ok:
         detail = resp.text.strip()
         raise RuntimeError(f"Azure ARM {method} {path} failed with {resp.status_code}: {detail}")
+    return resp
+
+
+def _kv_headers() -> dict[str, str]:
+    token = _credential().get_token(KEYVAULT_SCOPE).token
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _normalize_vault_url(vault_url: str) -> str:
+    cleaned = vault_url.strip().rstrip("/")
+    if not cleaned.startswith(("https://", "http://")):
+        cleaned = f"https://{cleaned}"
+    return cleaned
+
+
+def _kv_request(
+    method: str,
+    vault_url: str,
+    path: str,
+    *,
+    ok: set[int],
+    json: dict[str, Any] | None = None,
+    extra_query: dict[str, str] | None = None,
+) -> requests.Response:
+    base = _normalize_vault_url(vault_url)
+    if not path.startswith("/"):
+        path = f"/{path}"
+    query: list[str] = [f"api-version={KEYVAULT_API_VERSION}"]
+    if extra_query:
+        for key, value in extra_query.items():
+            if value is not None and value != "":
+                query.append(f"{key}={value}")
+    url = f"{base}{path}?{'&'.join(query)}"
+    resp = requests.request(method, url, headers=_kv_headers(), json=json, timeout=30)
+    if resp.status_code not in ok:
+        detail = resp.text.strip()
+        raise RuntimeError(f"Azure Key Vault {method} {path} failed with {resp.status_code}: {detail}")
     return resp
 
 
@@ -1097,3 +1139,186 @@ def register_tools(mcp: FastMCP) -> None:
             "logs": logs,
             "result": payload,
         }
+
+    @mcp.tool()
+    def keyvault_list_secrets(
+        vault_url: str,
+        name_contains: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List secret names + metadata in an Azure Key Vault.
+
+        `vault_url` like `https://romaine-kv.vault.azure.net`. `name_contains`
+        filters case-insensitively client-side. Values are not returned —
+        call `keyvault_get_secret` for the value of one secret.
+        """
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        secrets: list[dict[str, Any]] = []
+        next_path = "/secrets"
+        next_query: dict[str, str] = {"maxresults": "25"}
+        while next_path:
+            resp = _kv_request("GET", vault_url, next_path, ok={200}, extra_query=next_query)
+            payload = resp.json()
+            for item in payload.get("value", []):
+                ident = str(item.get("id") or "")
+                name = ident.rsplit("/", 1)[-1] if ident else ""
+                if name_contains and name_contains.lower() not in name.lower():
+                    continue
+                attrs = item.get("attributes") or {}
+                secrets.append(
+                    {
+                        "name": name,
+                        "id": ident,
+                        "enabled": attrs.get("enabled"),
+                        "created": attrs.get("created"),
+                        "updated": attrs.get("updated"),
+                        "content_type": item.get("contentType"),
+                        "tags": item.get("tags") or {},
+                    }
+                )
+                if len(secrets) >= limit:
+                    break
+            if len(secrets) >= limit:
+                break
+            next_link = payload.get("nextLink") or ""
+            if not next_link:
+                break
+            tail = next_link.split("?", 1)[-1]
+            next_query = {}
+            for chunk in tail.split("&"):
+                if "=" in chunk and not chunk.startswith("api-version="):
+                    key, value = chunk.split("=", 1)
+                    next_query[key] = value
+            next_path = "/secrets"
+        return {
+            "vault_url": _normalize_vault_url(vault_url),
+            "name_contains": name_contains,
+            "count": len(secrets),
+            "truncated": len(secrets) >= limit,
+            "secrets": secrets,
+        }
+
+    @mcp.tool()
+    def keyvault_get_secret(
+        vault_url: str,
+        name: str,
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        """Read one Azure Key Vault secret value + metadata.
+
+        Returns the plaintext `value` along with version, content_type, tags,
+        and timestamps. Pass `version` to point-read a non-current version;
+        omit to read the current version.
+        """
+        if not name:
+            raise ValueError("name is required")
+        path = f"/secrets/{name}"
+        if version:
+            path = f"/secrets/{name}/{version}"
+        payload = _kv_request("GET", vault_url, path, ok={200}).json()
+        attrs = payload.get("attributes") or {}
+        ident = str(payload.get("id") or "")
+        return {
+            "vault_url": _normalize_vault_url(vault_url),
+            "name": name,
+            "id": ident,
+            "version": ident.rsplit("/", 1)[-1] if ident.count("/") >= 4 else None,
+            "value": payload.get("value"),
+            "content_type": payload.get("contentType"),
+            "tags": payload.get("tags") or {},
+            "enabled": attrs.get("enabled"),
+            "created": attrs.get("created"),
+            "updated": attrs.get("updated"),
+        }
+
+    @mcp.tool()
+    def keyvault_set_secret(
+        vault_url: str,
+        name: str,
+        value: str,
+        dry_run: bool = True,
+        allow_create: bool = False,
+        content_type: str | None = None,
+        tags: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a new version of an Azure Key Vault secret.
+
+        `dry_run` defaults true and returns the current secret's metadata + a
+        plaintext-vs-new diff summary (lengths, equality) without writing.
+
+        `allow_create` defaults false: if `name` does not already exist in the
+        vault, the call errors out so a typo cannot silently create a new
+        secret. Set true to permit creation.
+
+        `content_type` and `tags` are passed through to Key Vault when
+        provided. Old versions are preserved automatically by Key Vault.
+        """
+        if not name:
+            raise ValueError("name is required")
+        if value is None:
+            raise ValueError("value is required (use empty string for an explicit blank)")
+
+        current_value: str | None = None
+        current_attrs: dict[str, Any] = {}
+        current_id: str | None = None
+        current_content_type: str | None = None
+        current_tags: dict[str, str] = {}
+        existed = False
+        try:
+            payload = _kv_request("GET", vault_url, f"/secrets/{name}", ok={200}).json()
+            existed = True
+            current_value = payload.get("value")
+            current_attrs = payload.get("attributes") or {}
+            current_id = str(payload.get("id") or "")
+            current_content_type = payload.get("contentType")
+            current_tags = payload.get("tags") or {}
+        except RuntimeError as exc:
+            # 404 surfaces as a RuntimeError from _kv_request; only treat
+            # SecretNotFound as "doesn't exist", surface other failures.
+            if "404" not in str(exc):
+                raise
+            if not allow_create:
+                raise RuntimeError(
+                    f"secret {name!r} does not exist in {_normalize_vault_url(vault_url)}; "
+                    "pass allow_create=true to create a new secret"
+                ) from None
+
+        diff = {
+            "current_length": len(current_value) if current_value is not None else None,
+            "new_length": len(value),
+            "unchanged": current_value == value,
+        }
+
+        plan = {
+            "vault_url": _normalize_vault_url(vault_url),
+            "name": name,
+            "existed": existed,
+            "current_id": current_id,
+            "current_content_type": current_content_type,
+            "current_tags": current_tags,
+            "current_attributes": current_attrs,
+            "diff": diff,
+            "would_create_new_secret": not existed,
+        }
+
+        if dry_run:
+            plan["dry_run"] = True
+            return plan
+
+        body: dict[str, Any] = {"value": value}
+        if content_type is not None:
+            body["contentType"] = content_type
+        if tags is not None:
+            body["tags"] = tags
+        resp = _kv_request("PUT", vault_url, f"/secrets/{name}", ok={200}, json=body).json()
+        new_attrs = resp.get("attributes") or {}
+        new_id = str(resp.get("id") or "")
+        plan["dry_run"] = False
+        plan["written"] = True
+        plan["new_id"] = new_id
+        plan["new_version"] = new_id.rsplit("/", 1)[-1] if new_id else None
+        plan["new_attributes"] = new_attrs
+        plan["new_content_type"] = resp.get("contentType")
+        plan["new_tags"] = resp.get("tags") or {}
+        return plan
