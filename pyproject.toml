@@ -10,7 +10,7 @@ dependencies = [
     "requests>=2.32.0",
     "starlette>=0.40.0",
     "uvicorn>=0.30.0",
-    "pyjwt[crypto]>=2.8.0",
+    "romaine-auth @ git+https://github.com/nelsong6/romaine-auth-py.git@dcc052dea53061c96734024a8cfe113b12b08b79",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +22,10 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# Required for the romaine-auth git URL dependency.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_azure_personal"]

@@ -21,7 +21,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from mcp_azure_personal.auth_verifier import (
+from romaine_auth import (
     CALLER,
     AuthRomaineLifeVerifier,
 )

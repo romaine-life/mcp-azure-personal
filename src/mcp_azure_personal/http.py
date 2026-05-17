@@ -38,7 +38,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
-from .auth_verifier import (
+from romaine_auth import (
     CALLER,
     AuthRomaineLifeVerifier,
     default_verifier,
