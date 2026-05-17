@@ -12,12 +12,14 @@ import os
 import time
 from typing import Any
 
+import psycopg
 import requests
 from azure.core import MatchConditions
 from azure.cosmos import CosmosClient
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 from azure.identity import DefaultAzureCredential, WorkloadIdentityCredential
 from mcp.server.fastmcp import FastMCP
+from psycopg.rows import dict_row
 
 
 ARM = "https://management.azure.com"
@@ -25,6 +27,7 @@ ARM_SCOPE = "https://management.azure.com/.default"
 GRAPH = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 KEYVAULT_SCOPE = "https://vault.azure.net/.default"
+POSTGRES_OSSRDBMS_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
 KEYVAULT_API_VERSION = "7.4"
 RESOURCES_API_VERSION = "2021-04-01"
 STATIC_SITE_API_VERSION = "2024-04-01"
@@ -36,6 +39,12 @@ POLL_TIMEOUT_SECONDS = 600
 DEFAULT_QUERY_LIMIT = 100
 MAX_QUERY_LIMIT = 1000
 MAX_COSMOS_RESPONSE_ITEMS = 1000
+DEFAULT_PG_QUERY_LIMIT = 100
+MAX_PG_QUERY_LIMIT = 1000
+DEFAULT_PG_STATEMENT_TIMEOUT_MS = 30_000
+MAX_PG_STATEMENT_TIMEOUT_MS = 600_000
+DEFAULT_PG_CONNECT_TIMEOUT_SECONDS = 10
+MAX_PG_CONNECT_TIMEOUT_SECONDS = 60
 
 
 def _subscription(subscription: str | None) -> str:
@@ -94,6 +103,40 @@ def _cosmos_container(
         credential=_credential(),
     )
     return client.get_database_client(database).get_container_client(container)
+
+
+def _pg_token() -> str:
+    return _credential().get_token(POSTGRES_OSSRDBMS_SCOPE).token
+
+
+def _pg_user(user: str | None) -> str:
+    resolved = user or os.environ.get("MCP_AZURE_PG_USER")
+    if not resolved:
+        raise ValueError(
+            "user is required (or set MCP_AZURE_PG_USER) — must be the Postgres "
+            "role name mapped to this MCP's Entra principal (typically the "
+            "UAMI's display name)"
+        )
+    return resolved
+
+
+def _pg_jsonable(value: Any) -> Any:
+    """Convert psycopg-returned values into JSON-safe primitives.
+
+    Numeric/bool/str/None pass through unchanged. dict and list/tuple recurse.
+    Everything else (datetime, Decimal, UUID, Range, Interval, memoryview, …)
+    is rendered through ``str()``. JSON columns already arrive as dict/list,
+    so they round-trip cleanly.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _pg_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_pg_jsonable(v) for v in value]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<{len(bytes(value))} bytes>"
+    return str(value)
 
 
 def _bounded_limit(limit: int | None) -> int:
@@ -1188,6 +1231,105 @@ def register_tools(mcp: FastMCP) -> None:
             "container": container,
             "id": item_id,
             "partition_key": partition_key,
+        }
+
+    @mcp.tool()
+    def pg_query(
+        host: str,
+        database: str,
+        query: str,
+        parameters: list[Any] | dict[str, Any] | None = None,
+        user: str | None = None,
+        port: int = 5432,
+        sslmode: str = "require",
+        limit: int = DEFAULT_PG_QUERY_LIMIT,
+        statement_timeout_ms: int = DEFAULT_PG_STATEMENT_TIMEOUT_MS,
+        connect_timeout_seconds: int = DEFAULT_PG_CONNECT_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Run a read-only SQL query against Azure Database for PostgreSQL Flexible Server using Entra ID auth.
+
+        The MCP's workload identity is exchanged for an `ossrdbms-aad` access
+        token and used as the connection password. `user` must be the Postgres
+        role mapped to that Entra principal (typically the UAMI's display
+        name); when omitted it falls back to the `MCP_AZURE_PG_USER` env var.
+
+        The session is forced to `default_transaction_read_only = on` so
+        writes raise an error from Postgres rather than being silently
+        accepted. Pass `parameters` as a list for `%s` placeholders or a dict
+        for `%(name)s` placeholders. `limit` caps returned rows; the call also
+        applies `statement_timeout` on the postgres side. `sslmode` defaults
+        to `require` — Azure Flexible Server's public endpoint enforces TLS.
+        """
+        if limit < 1 or limit > MAX_PG_QUERY_LIMIT:
+            raise ValueError(f"limit must be between 1 and {MAX_PG_QUERY_LIMIT}")
+        if statement_timeout_ms < 1000 or statement_timeout_ms > MAX_PG_STATEMENT_TIMEOUT_MS:
+            raise ValueError(
+                f"statement_timeout_ms must be between 1000 and {MAX_PG_STATEMENT_TIMEOUT_MS}"
+            )
+        if connect_timeout_seconds < 1 or connect_timeout_seconds > MAX_PG_CONNECT_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"connect_timeout_seconds must be between 1 and {MAX_PG_CONNECT_TIMEOUT_SECONDS}"
+            )
+        if port < 1 or port > 65535:
+            raise ValueError("port must be between 1 and 65535")
+        if not query or not query.strip():
+            raise ValueError("query must be non-empty")
+
+        resolved_user = _pg_user(user)
+        token = _pg_token()
+
+        columns: list[str] = []
+        rows: list[dict[str, Any]] = []
+        truncated = False
+        row_count_reported: int | None = None
+
+        conn = psycopg.connect(
+            host=host,
+            port=port,
+            dbname=database,
+            user=resolved_user,
+            password=token,
+            sslmode=sslmode,
+            connect_timeout=connect_timeout_seconds,
+            application_name="mcp-azure-personal",
+            row_factory=dict_row,
+        )
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    # SET TRANSACTION READ ONLY must come before any data query
+                    # in the transaction. SET LOCAL is fine alongside it.
+                    # Note: Postgres SET does not accept query parameters, so
+                    # the timeout value is interpolated directly — safe because
+                    # statement_timeout_ms is validated as an int above.
+                    cur.execute("SET TRANSACTION READ ONLY")
+                    cur.execute(
+                        f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}"
+                    )
+                    cur.execute(query, parameters)
+                    row_count_reported = cur.rowcount if cur.rowcount >= 0 else None
+                    if cur.description is not None:
+                        columns = [desc.name for desc in cur.description]
+                        raw_rows = cur.fetchmany(limit + 1)
+                        truncated = len(raw_rows) > limit
+                        rows = [
+                            {k: _pg_jsonable(v) for k, v in row.items()}
+                            for row in raw_rows[:limit]
+                        ]
+        finally:
+            conn.close()
+
+        return {
+            "host": host,
+            "port": port,
+            "database": database,
+            "user": resolved_user,
+            "sslmode": sslmode,
+            "columns": columns,
+            "row_count": len(rows),
+            "rows_reported_by_server": row_count_reported,
+            "rows": rows,
+            "truncated": truncated,
         }
 
     @mcp.tool()
