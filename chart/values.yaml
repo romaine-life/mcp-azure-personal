@@ -2,8 +2,9 @@
 # mcp-azure values
 # ============================================================================
 # UAMI client ID and tenant ID are synced from Key Vault at runtime via the
-# ExternalSecret in templates/externalsecret.yaml. See infra/mcp.tf and
-# infra/mcp-server/ for the upstream definitions.
+# ExternalSecret in templates/externalsecret.yaml. The UAMI itself is defined
+# in ../infra/. The shared `mcp-tenant-id` KV secret lives in
+# nelsong6/tank-operator/infra/mcp.tf (cross-MCP convenience).
 
 image:
   repository: romainecr.azurecr.io/mcp-azure-personal

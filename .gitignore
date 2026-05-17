@@ -6,3 +6,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Terraform / OpenTofu working directory (provider cache, plan files, etc.).
+# The lockfile `.terraform.lock.hcl` is tracked.
+.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan

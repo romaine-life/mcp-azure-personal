@@ -1,0 +1,79 @@
+name: Infrastructure
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/tofu.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/tofu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: opentofu-mcp-azure-personal
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_INPUT: "false"
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  TF_VAR_arm_subscription_id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  TF_VAR_arm_tenant_id: ${{ vars.ARM_TENANT_ID }}
+
+jobs:
+  tofu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: '1.9.0'
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - name: tofu init
+        working-directory: infra
+        run: |
+          tofu init \
+            -backend-config="resource_group_name=infra" \
+            -backend-config="storage_account_name=nelsontofu" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=mcp-azure-personal.tfstate"
+
+      - name: tofu fmt -check
+        working-directory: infra
+        run: tofu fmt -check -recursive
+
+      - name: tofu validate
+        working-directory: infra
+        run: tofu validate
+
+      - name: tofu plan
+        working-directory: infra
+        run: tofu plan -out=tfplan
+
+      - name: tofu apply
+        # Apply on push to main (the normal path), and on manual
+        # workflow_dispatch so an out-of-band rerun (recovering from a
+        # failed apply, etc.) doesn't need an empty commit to retrigger.
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          github.event_name == 'workflow_dispatch'
+        working-directory: infra
+        run: tofu apply -auto-approve tfplan
