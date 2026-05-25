@@ -1,7 +1,7 @@
 variable "key_vault_name" {
-  description = "Key Vault that receives the UAMI client ID secret for ESO sync."
+  description = "MCP Azure Personal-owned Key Vault for runtime configuration."
   type        = string
-  default     = "romaine-kv"
+  default     = "ng6-mcp-azure-personal"
 }
 
 variable "key_vault_resource_group" {
