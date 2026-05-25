@@ -8,7 +8,8 @@ permissions:
 | `azurerm_user_assigned_identity.mcp` (in `mcp-server/`) | The UAMI everything else binds to. Display name is `mcp-azure-personal-identity` — also used as the Postgres role name for Entra-auth connections. |
 | `azurerm_federated_identity_credential.pod` | Binds the K8s SA `mcp-azure-personal/mcp-azure-personal` to the UAMI via the AKS OIDC issuer. |
 | `azurerm_role_assignment.granted["subscription-operator"]` | Subscription-scope Contributor. The MCP's ARM tools call against this. |
-| `azurerm_role_assignment.granted["romaine-kv-secrets-officer"]` | Data-plane Key Vault Secrets Officer on `romaine-kv`. |
+| `azurerm_role_assignment.uami_workload_sub_keyvault_secrets_officer` | Subscription-scope Key Vault Secrets Officer on the workload subscription. |
+| `azurerm_role_assignment.uami_cluster_sub_keyvault_secrets_officer` | Subscription-scope Key Vault Secrets Officer on the AKS cluster subscription. |
 | `azurerm_cosmosdb_sql_role_assignment.infra_serverless_contributor` | Cosmos data-plane Built-in Data Contributor on `infra-cosmos-serverless`. |
 | `azurerm_key_vault_secret.mi_client_id` (in `mcp-server/`) | Publishes the UAMI's client ID so the chart's ExternalSecret can sync it into `AZURE_CLIENT_ID` on the pod. |
 | `azurerm_postgresql_flexible_server_active_directory_administrator.tank_operator_db` | Registers the UAMI as an Entra AD admin on `tank-operator-db` so the `pg_query` tool can read the session registry. New in this PR. |
