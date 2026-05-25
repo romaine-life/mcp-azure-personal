@@ -161,3 +161,22 @@ resource "azurerm_postgresql_flexible_server_active_directory_administrator" "ta
   principal_name      = module.mcp_azure_personal.managed_identity_name
   principal_type      = "ServicePrincipal"
 }
+
+# Same shape as tank_operator_db above, against the glimmung-pg server
+# provisioned in nelsong6/glimmung#565 (Stage 1 of the Cosmos -> Postgres
+# migration documented in nelsong6/glimmung/docs/postgres-migration.md).
+# Granted now (immediately after the pg package foundation lands in
+# glimmung#566 / Stage 2a) so I can pg_query against glimmung-pg to
+# verify each subsequent per-interface cutover lands correctly.
+#
+# The `cosmos_query_items` tool stays for the four remaining apps
+# (ambience, kill-me, my-homepage, investing) still on the shared
+# infra-cosmos-serverless account.
+resource "azurerm_postgresql_flexible_server_active_directory_administrator" "glimmung_db" {
+  server_name         = var.glimmung_postgres_server_name
+  resource_group_name = var.glimmung_postgres_resource_group
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  object_id           = module.mcp_azure_personal.managed_identity_principal_id
+  principal_name      = module.mcp_azure_personal.managed_identity_name
+  principal_type      = "ServicePrincipal"
+}
