@@ -1,10 +1,9 @@
 # ============================================================================
 # mcp-azure values
 # ============================================================================
-# UAMI client ID and tenant ID are synced from Key Vault at runtime via the
-# ExternalSecret in templates/externalsecret.yaml. The UAMI itself is defined
-# in ../infra/. The shared `mcp-tenant-id` KV secret lives in
-# nelsong6/tank-operator/infra/mcp.tf (cross-MCP convenience).
+# UAMI client ID and tenant ID are synced from the app-owned Key Vault at
+# runtime via the ExternalSecret in templates/externalsecret.yaml. The UAMI
+# and app-vault secret copies are defined in ../infra/.
 
 image:
   repository: romainecr.azurecr.io/mcp-azure-personal
@@ -18,6 +17,11 @@ image:
 upstreamPort: 8080
 
 subscriptionId: 606a1ca1-5833-4d21-8937-d0fcd97cd0a0
+
+externalSecret:
+  storeName: ng6-mcp-azure-personal
+  storeKind: ClusterSecretStore
+  vaultUrl: https://ng6-mcp-azure-personal.vault.azure.net/
 
 # kube-rbac-proxy sidecar — terminates client connections, calls the K8s
 # API's TokenReview to validate incoming bearer SA tokens, then forwards to
