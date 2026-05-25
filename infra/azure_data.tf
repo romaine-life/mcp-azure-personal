@@ -1,6 +1,10 @@
-# Shared Azure data sources. Underlying resources (RG, KV, AKS, the
+# Shared Azure data sources. Underlying resources (RG, shared KV, AKS, the
 # tank-operator Postgres server, the infra-cosmos-serverless Cosmos account)
 # live in other repos' state — this stack only reads them.
+
+locals {
+  shared_key_vault_name = "romaine-kv"
+}
 
 data "azurerm_client_config" "current" {}
 
@@ -8,9 +12,14 @@ data "azurerm_resource_group" "main" {
   name = var.resource_group_name
 }
 
-data "azurerm_key_vault" "main" {
-  name                = var.key_vault_name
+data "azurerm_key_vault" "shared" {
+  name                = local.shared_key_vault_name
   resource_group_name = var.key_vault_resource_group
+}
+
+data "azurerm_user_assigned_identity" "external_secrets" {
+  name                = "infra-shared-identity"
+  resource_group_name = data.azurerm_resource_group.main.name
 }
 
 # infra-bootstrap publishes the AKS OIDC issuer URL on its remote state.

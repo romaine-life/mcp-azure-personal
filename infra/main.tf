@@ -22,7 +22,7 @@ module "mcp_azure_personal" {
   name                     = "azure-personal"
   resource_group_name      = data.azurerm_resource_group.main.name
   resource_group_location  = data.azurerm_resource_group.main.location
-  key_vault_id             = data.azurerm_key_vault.main.id
+  key_vault_id             = data.azurerm_key_vault.shared.id
   aks_oidc_issuer_url      = local.aks_oidc_issuer_url
   aks_namespace            = "mcp-azure-personal"
   aks_service_account_name = "mcp-azure-personal"
