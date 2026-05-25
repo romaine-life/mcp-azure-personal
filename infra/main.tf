@@ -22,7 +22,6 @@ module "mcp_azure_personal" {
   name                     = "azure-personal"
   resource_group_name      = data.azurerm_resource_group.main.name
   resource_group_location  = data.azurerm_resource_group.main.location
-  key_vault_id             = data.azurerm_key_vault.shared.id
   aks_oidc_issuer_url      = local.aks_oidc_issuer_url
   aks_namespace            = "mcp-azure-personal"
   aks_service_account_name = "mcp-azure-personal"
@@ -46,7 +45,7 @@ module "mcp_azure_personal" {
 # ----------------------------------------------------------------------------
 # Subscription Contributor covers Key Vault control-plane reads/writes, but not
 # secret values. Grant Secrets Officer at subscription scope so the MCP can read,
-# set, and dry-run-delete secrets in app-owned vaults as apps move off romaine-kv.
+# set, and dry-run-delete secrets in app-owned vaults.
 resource "azurerm_role_assignment" "uami_workload_sub_keyvault_secrets_officer" {
   scope                = "/subscriptions/${data.azurerm_client_config.current.subscription_id}"
   role_definition_name = "Key Vault Secrets Officer"

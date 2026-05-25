@@ -11,8 +11,10 @@ permissions:
 | `azurerm_role_assignment.uami_workload_sub_keyvault_secrets_officer` | Subscription-scope Key Vault Secrets Officer on the workload subscription. |
 | `azurerm_role_assignment.uami_cluster_sub_keyvault_secrets_officer` | Subscription-scope Key Vault Secrets Officer on the AKS cluster subscription. |
 | `azurerm_cosmosdb_sql_role_assignment.infra_serverless_contributor` | Cosmos data-plane Built-in Data Contributor on `infra-cosmos-serverless`. |
-| `azurerm_key_vault_secret.mi_client_id` (in `mcp-server/`) | Publishes the UAMI's client ID so the chart's ExternalSecret can sync it into `AZURE_CLIENT_ID` on the pod. |
-| `azurerm_postgresql_flexible_server_active_directory_administrator.tank_operator_db` | Registers the UAMI as an Entra AD admin on `tank-operator-db` so the `pg_query` tool can read the session registry. New in this PR. |
+| `azurerm_key_vault.main` | App-owned Key Vault for the MCP server's runtime configuration. |
+| `azurerm_key_vault_secret.app_mi_client_id` | Publishes the UAMI's client ID in the app-owned vault so the chart's ExternalSecret can sync it into `AZURE_CLIENT_ID` on the pod. |
+| `azurerm_key_vault_secret.app_tenant_id` | Publishes the tenant ID in the app-owned vault for workload identity runtime configuration. |
+| `azurerm_postgresql_flexible_server_active_directory_administrator.tank_operator_db` | Registers the UAMI as an Entra AD admin on `tank-operator-db` so the `pg_query` tool can read the session registry. |
 
 State is stored in `nelsontofu` blob container `tfstate` under key
 `mcp-azure-personal.tfstate` (see `.github/workflows/tofu.yml`).

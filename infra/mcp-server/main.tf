@@ -38,14 +38,3 @@ resource "azurerm_role_assignment" "granted" {
   role_definition_name = each.value.role_definition_name
   principal_id         = azurerm_user_assigned_identity.mcp.principal_id
 }
-
-# Published so the Helm chart can sync it via ExternalSecret into env vars
-# on the pod (AZURE_CLIENT_ID). Plain Helm values.yaml can't reference
-# tofu state directly, and the workload-identity webhook needs the client
-# ID either as a SA annotation or as the env var — KV → ESO → envFrom is
-# the existing pattern in this repo.
-resource "azurerm_key_vault_secret" "mi_client_id" {
-  name         = "mcp-${var.name}-mi-client-id"
-  value        = azurerm_user_assigned_identity.mcp.client_id
-  key_vault_id = var.key_vault_id
-}

@@ -1,20 +1,11 @@
-# Shared Azure data sources. Underlying resources (RG, shared KV, AKS, the
-# tank-operator Postgres server, the infra-cosmos-serverless Cosmos account)
-# live in other repos' state — this stack only reads them.
-
-locals {
-  shared_key_vault_name = "romaine-kv"
-}
+# Shared Azure data sources. Underlying resources (RG, AKS, the tank-operator
+# Postgres server, the infra-cosmos-serverless Cosmos account) live in other
+# repos' state — this stack only reads them.
 
 data "azurerm_client_config" "current" {}
 
 data "azurerm_resource_group" "main" {
   name = var.resource_group_name
-}
-
-data "azurerm_key_vault" "shared" {
-  name                = local.shared_key_vault_name
-  resource_group_name = var.key_vault_resource_group
 }
 
 data "azurerm_user_assigned_identity" "external_secrets" {
