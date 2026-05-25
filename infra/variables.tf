@@ -22,6 +22,18 @@ variable "tank_operator_postgres_resource_group" {
   default     = "infra"
 }
 
+variable "glimmung_postgres_server_name" {
+  description = "Name of the glimmung Postgres Flexible Server. The MCP's UAMI is registered as an AAD admin so the pg_query tool can read glimmung's durable store during the Cosmos -> Postgres migration (see nelsong6/glimmung docs/postgres-migration.md)."
+  type        = string
+  default     = "glimmung-pg"
+}
+
+variable "glimmung_postgres_resource_group" {
+  description = "Resource group of the glimmung Postgres server. Per nelsong6/glimmung/tofu/identity.tf, glimmung-owned resources live in the `glimmung` resource group, not the shared `infra` RG."
+  type        = string
+  default     = "glimmung"
+}
+
 variable "tank_aks_cluster_id" {
   description = "Full ARM ID of the AKS cluster the run_aks_command tool targets. This cluster lives in a different subscription from the rest of this stack, so it can't be derived from data.azurerm_client_config.current — the scope has to be passed in explicitly."
   type        = string
