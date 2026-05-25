@@ -1448,7 +1448,7 @@ def register_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """List secret names + metadata in an Azure Key Vault.
 
-        `vault_url` like `https://romaine-kv.vault.azure.net`. `name_contains`
+        `vault_url` like `https://ng6-example.vault.azure.net`. `name_contains`
         filters case-insensitively client-side. Values are not returned —
         call `keyvault_get_secret` for the value of one secret.
         """
@@ -1638,7 +1638,7 @@ def register_tools(mcp: FastMCP) -> None:
         `existed: false` rather than an error so a re-run after a real
         delete is idempotent.
 
-        Soft-delete-enabled vaults (romaine-kv is one) move the secret
+        Soft-delete-enabled vaults move the secret
         to the "deleted" state on delete. Recover with the Azure portal
         / `az keyvault secret recover`, or wait out the retention period
         for permanent purge. This tool does NOT call /deletedsecrets to
@@ -1700,7 +1700,7 @@ def register_tools(mcp: FastMCP) -> None:
         plan["deleted"] = True
         plan["deleted_id"] = deleted_id
         # Soft-delete metadata surfaced when the vault has soft-delete
-        # enabled (romaine-kv: yes). recoveryId points at the
+        # enabled. recoveryId points at the
         # /deletedsecrets/<name> entry; scheduled_purge_date is when
         # the soft-delete retention expires.
         plan["recovery_id"] = resp.get("recoveryId")
