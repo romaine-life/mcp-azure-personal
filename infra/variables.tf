@@ -4,12 +4,6 @@ variable "key_vault_name" {
   default     = "ng6-mcp-azure-personal"
 }
 
-variable "key_vault_resource_group" {
-  description = "Resource group containing key_vault_name."
-  type        = string
-  default     = "infra"
-}
-
 variable "resource_group_name" {
   description = "Resource group where the UAMI lives. Matches tank-operator's convention."
   type        = string

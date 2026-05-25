@@ -11,11 +11,6 @@ variable "resource_group_location" {
   type = string
 }
 
-variable "key_vault_id" {
-  description = "Key Vault that receives the UAMI client ID secret for ESO sync."
-  type        = string
-}
-
 variable "aks_oidc_issuer_url" {
   description = "OIDC issuer URL of the AKS cluster — federates the pod SA to this server's UAMI."
   type        = string
