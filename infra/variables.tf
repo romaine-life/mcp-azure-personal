@@ -11,7 +11,7 @@ variable "resource_group_name" {
 }
 
 variable "tank_operator_postgres_server_name" {
-  description = "Name of the tank-operator Postgres Flexible Server. The MCP's UAMI is registered as an AAD admin so the pg_query tool can read tank-operator's session registry."
+  description = "Name of the tank-operator Postgres Flexible Server. The MCP's UAMI is registered as an AAD admin so the Postgres MCP tools can read and explicitly repair tank-operator's session registry."
   type        = string
   default     = "tank-operator-db"
 }
@@ -23,7 +23,7 @@ variable "tank_operator_postgres_resource_group" {
 }
 
 variable "glimmung_postgres_server_name" {
-  description = "Name of the glimmung Postgres Flexible Server. The MCP's UAMI is registered as an AAD admin so the pg_query tool can read glimmung's durable store during the Cosmos -> Postgres migration (see nelsong6/glimmung docs/postgres-migration.md)."
+  description = "Name of the glimmung Postgres Flexible Server. The MCP's UAMI is registered as an AAD admin so the Postgres MCP tools can read and explicitly repair glimmung's durable store."
   type        = string
   default     = "glimmung-pg"
 }
