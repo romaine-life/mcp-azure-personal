@@ -141,18 +141,17 @@ resource "azurerm_role_assignment" "uami_cluster_sub_cost_management_reader" {
 }
 
 # ----------------------------------------------------------------------------
-# Postgres data-plane access (pg_query)
+# Postgres data-plane access (pg_query / pg_execute)
 # ----------------------------------------------------------------------------
 # Registers this MCP's UAMI as an Entra AD admin on the tank-operator Postgres
-# Flexible Server so the pg_query tool can authenticate with a workload-
+# Flexible Server so the Postgres MCP tools can authenticate with a workload-
 # identity token. Mirrors the pattern tank-operator uses for its own
 # orchestrator UAMI (infra/postgres.tf in tank-operator).
 #
-# Admin rather than a narrower SQL role is the deliberately simple choice;
-# the pg_query tool clamps every transaction to READ ONLY server-side, so
-# the practical privilege is constrained at the call site. If we ever add a
-# write tool, tighten this to a non-admin role with explicit SELECT grants
-# created via SQL.
+# Admin rather than a narrower SQL role is the deliberately simple choice:
+# pg_query remains server-side read-only, and pg_execute is intentionally
+# separate, host-allowlisted, dry-run-by-default, single-statement DML with
+# affected-row caps and audit logging.
 resource "azurerm_postgresql_flexible_server_active_directory_administrator" "tank_operator_db" {
   server_name         = var.tank_operator_postgres_server_name
   resource_group_name = var.tank_operator_postgres_resource_group
@@ -165,9 +164,8 @@ resource "azurerm_postgresql_flexible_server_active_directory_administrator" "ta
 # Same shape as tank_operator_db above, against the glimmung-pg server
 # provisioned in nelsong6/glimmung#565 (Stage 1 of the Cosmos -> Postgres
 # migration documented in nelsong6/glimmung/docs/postgres-migration.md).
-# Granted now (immediately after the pg package foundation lands in
-# glimmung#566 / Stage 2a) so I can pg_query against glimmung-pg to
-# verify each subsequent per-interface cutover lands correctly.
+# Granted now so the Postgres MCP tools can inspect and, when explicitly
+# requested through pg_execute, repair Glimmung control-plane state.
 #
 # The `cosmos_query_items` tool stays for the four remaining apps
 # (ambience, kill-me, my-homepage, investing) still on the shared

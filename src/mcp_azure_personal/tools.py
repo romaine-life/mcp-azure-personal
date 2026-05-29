@@ -8,6 +8,8 @@ remote scripts.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import time
 from typing import Any
@@ -18,7 +20,9 @@ from azure.cosmos import CosmosClient
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 from azure.identity import DefaultAzureCredential, WorkloadIdentityCredential
 from mcp.server.fastmcp import FastMCP
+from romaine_auth import CALLER
 
+log = logging.getLogger(__name__)
 
 ARM = "https://management.azure.com"
 ARM_SCOPE = "https://management.azure.com/.default"
@@ -45,6 +49,14 @@ MAX_PG_ROW_LIMIT = 1000
 DEFAULT_PG_STATEMENT_TIMEOUT_MS = 10_000
 MAX_PG_STATEMENT_TIMEOUT_MS = 60_000
 DEFAULT_PG_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_PG_AFFECTED_ROW_LIMIT = 1_000
+MAX_PG_AFFECTED_ROW_LIMIT = 100_000
+PG_EXECUTE_ALLOWED_HOSTS_ENV = "PG_EXECUTE_ALLOWED_HOSTS"
+DEFAULT_PG_EXECUTE_ALLOWED_HOSTS = frozenset({
+    "tank-operator-db.postgres.database.azure.com",
+    "glimmung-pg.postgres.database.azure.com",
+})
+PG_EXECUTE_ALLOWED_STATEMENTS = frozenset({"insert", "update", "delete", "merge"})
 
 
 def _subscription(subscription: str | None) -> str:
@@ -157,6 +169,183 @@ def _jsonable_pg_value(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).hex()
     return str(value)
+
+
+def _pg_actor() -> str | None:
+    caller = CALLER.get(None)
+    if caller is None:
+        return None
+    return caller.display_actor
+
+
+def _normalize_pg_host_for_execute(host: str) -> str:
+    cleaned = str(host or "").strip().lower().rstrip(".")
+    if not cleaned:
+        raise ValueError("host is required")
+    if "/" in cleaned or ":" in cleaned:
+        raise ValueError("host must be a DNS name without scheme or port")
+    return cleaned
+
+
+def _pg_execute_allowed_hosts() -> set[str]:
+    configured = os.environ.get(PG_EXECUTE_ALLOWED_HOSTS_ENV)
+    if configured is None or not configured.strip():
+        return set(DEFAULT_PG_EXECUTE_ALLOWED_HOSTS)
+    hosts = {
+        part.strip().lower().rstrip(".")
+        for part in configured.split(",")
+        if part.strip()
+    }
+    if not hosts:
+        raise ValueError(f"{PG_EXECUTE_ALLOWED_HOSTS_ENV} must contain at least one host")
+    return hosts
+
+
+def _pg_dollar_quote_tag(sql: str, start: int) -> str | None:
+    end = sql.find("$", start + 1)
+    if end < 0:
+        return None
+    tag_body = sql[start + 1:end]
+    if tag_body and not all(ch.isalnum() or ch == "_" for ch in tag_body):
+        return None
+    return sql[start:end + 1]
+
+
+def _pg_semicolon_positions(sql: str) -> list[int]:
+    positions: list[int] = []
+    i = 0
+    n = len(sql)
+    single_quote = False
+    double_quote = False
+    line_comment = False
+    block_comment = False
+    dollar_quote: str | None = None
+
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+
+        if dollar_quote is not None:
+            if sql.startswith(dollar_quote, i):
+                i += len(dollar_quote)
+                dollar_quote = None
+            else:
+                i += 1
+            continue
+
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+            i += 1
+            continue
+
+        if block_comment:
+            if ch == "*" and nxt == "/":
+                block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if single_quote:
+            if ch == "'" and nxt == "'":
+                i += 2
+            elif ch == "'":
+                single_quote = False
+                i += 1
+            else:
+                i += 1
+            continue
+
+        if double_quote:
+            if ch == '"' and nxt == '"':
+                i += 2
+            elif ch == '"':
+                double_quote = False
+                i += 1
+            else:
+                i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            single_quote = True
+            i += 1
+            continue
+        if ch == '"':
+            double_quote = True
+            i += 1
+            continue
+        if ch == "$":
+            tag = _pg_dollar_quote_tag(sql, i)
+            if tag is not None:
+                dollar_quote = tag
+                i += len(tag)
+                continue
+        if ch == ";":
+            positions.append(i)
+        i += 1
+
+    return positions
+
+
+def _pg_first_code_index(sql: str, start: int = 0) -> int | None:
+    i = start
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "-" and nxt == "-":
+            newline = sql.find("\n", i + 2)
+            if newline < 0:
+                return None
+            i = newline + 1
+            continue
+        if ch == "/" and nxt == "*":
+            end = sql.find("*/", i + 2)
+            if end < 0:
+                raise ValueError("unterminated block comment in sql")
+            i = end + 2
+            continue
+        return i
+    return None
+
+
+def _pg_first_keyword(sql: str) -> str:
+    start = _pg_first_code_index(sql)
+    if start is None:
+        return ""
+    end = start
+    while end < len(sql) and (sql[end].isalpha() or sql[end] == "_"):
+        end += 1
+    return sql[start:end].lower()
+
+
+def _validate_pg_execute_sql(sql: str) -> str:
+    if not sql or not sql.strip():
+        raise ValueError("sql is required")
+
+    semicolons = _pg_semicolon_positions(sql)
+    if len(semicolons) > 1 or (
+        semicolons and _pg_first_code_index(sql, semicolons[0] + 1) is not None
+    ):
+        raise ValueError("sql must contain exactly one statement")
+
+    keyword = _pg_first_keyword(sql)
+    if keyword not in PG_EXECUTE_ALLOWED_STATEMENTS:
+        allowed = ", ".join(sorted(statement.upper() for statement in PG_EXECUTE_ALLOWED_STATEMENTS))
+        raise ValueError(f"pg_execute only allows one data-changing statement: {allowed}")
+    return keyword
 
 
 def _etag(doc: dict[str, Any]) -> str | None:
@@ -1820,4 +2009,171 @@ def register_tools(mcp: FastMCP) -> None:
             "row_count": row_count if row_count is not None else len(rows),
             "rows": rows,
             "truncated": truncated,
+        }
+
+    @mcp.tool()
+    def pg_execute(
+        host: str,
+        database: str,
+        user: str,
+        sql: str,
+        parameters: list[Any] | None = None,
+        dry_run: bool = True,
+        result_limit: int = DEFAULT_PG_ROW_LIMIT,
+        max_affected_rows: int = DEFAULT_PG_AFFECTED_ROW_LIMIT,
+        allow_unknown_row_count: bool = False,
+        statement_timeout_ms: int = DEFAULT_PG_STATEMENT_TIMEOUT_MS,
+        port: int = 5432,
+    ) -> dict[str, Any]:
+        """Run one write-capable Postgres DML statement via this MCP's UAMI.
+
+        This is the sanctioned companion to `pg_query`: use `pg_query` for
+        reads, and use `pg_execute` for explicit data-changing statements
+        (`INSERT`, `UPDATE`, `DELETE`, or `MERGE`). The target host must be in
+        `PG_EXECUTE_ALLOWED_HOSTS` (comma-separated) or one of the built-in
+        Tank/Glimmung Postgres hosts.
+
+        `dry_run` defaults true: the statement is executed inside a
+        transaction, any `RETURNING` rows are fetched, and the transaction is
+        rolled back. Set `dry_run=false` to commit. `parameters` is a
+        positional list bound to `%s` placeholders, `statement_timeout_ms` is
+        enforced server-side, and `max_affected_rows` rolls back statements
+        that touch more rows than expected.
+        """
+        # Local imports match pg_query so the rest of the server can load even
+        # if a future build accidentally drops the psycopg extra.
+        import psycopg
+        from psycopg.rows import dict_row
+
+        normalized_host = _normalize_pg_host_for_execute(host)
+        allowed_hosts = _pg_execute_allowed_hosts()
+        if normalized_host not in allowed_hosts:
+            allowed = ", ".join(sorted(allowed_hosts))
+            raise ValueError(
+                f"host is not allowed for pg_execute: {normalized_host!r}; "
+                f"allowed hosts: {allowed}"
+            )
+        if not database:
+            raise ValueError("database is required")
+        if not user:
+            raise ValueError("user is required")
+        if result_limit < 1 or result_limit > MAX_PG_ROW_LIMIT:
+            raise ValueError(f"result_limit must be between 1 and {MAX_PG_ROW_LIMIT}")
+        if (
+            max_affected_rows < 1
+            or max_affected_rows > MAX_PG_AFFECTED_ROW_LIMIT
+        ):
+            raise ValueError(
+                f"max_affected_rows must be between 1 and {MAX_PG_AFFECTED_ROW_LIMIT}"
+            )
+        if (
+            statement_timeout_ms < 100
+            or statement_timeout_ms > MAX_PG_STATEMENT_TIMEOUT_MS
+        ):
+            raise ValueError(
+                f"statement_timeout_ms must be between 100 and {MAX_PG_STATEMENT_TIMEOUT_MS}"
+            )
+        if port < 1 or port > 65535:
+            raise ValueError("port must be between 1 and 65535")
+
+        statement_type = _validate_pg_execute_sql(sql)
+        sql_sha256 = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+        actor = _pg_actor()
+        token = _credential().get_token(PG_OSS_SCOPE).token
+
+        bound_params: tuple[Any, ...] = tuple(parameters or ())
+        truncated = False
+        columns: list[str] = []
+        rows: list[dict[str, Any]] = []
+        row_count: int | None = None
+
+        log.info(
+            "pg_execute requested actor=%s host=%s database=%s user=%s "
+            "statement_type=%s dry_run=%s max_affected_rows=%s sql_sha256=%s "
+            "parameter_count=%s",
+            actor or "<unknown>",
+            normalized_host,
+            database,
+            user,
+            statement_type,
+            dry_run,
+            max_affected_rows,
+            sql_sha256,
+            len(bound_params),
+        )
+
+        with psycopg.connect(
+            host=normalized_host,
+            port=port,
+            dbname=database,
+            user=user,
+            password=token,
+            sslmode="require",
+            connect_timeout=DEFAULT_PG_CONNECT_TIMEOUT_SECONDS,
+            application_name="mcp-azure-personal pg_execute",
+            options=f"-c statement_timeout={int(statement_timeout_ms)}",
+        ) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, bound_params)
+                row_count = cur.rowcount if cur.rowcount >= 0 else None
+                if cur.description is not None:
+                    columns = [str(d.name) for d in cur.description]
+                    fetched = cur.fetchmany(result_limit + 1)
+                    if len(fetched) > result_limit:
+                        truncated = True
+                        fetched = fetched[:result_limit]
+                    rows = [
+                        {k: _jsonable_pg_value(v) for k, v in row.items()}
+                        for row in fetched
+                    ]
+
+            if row_count is None and not allow_unknown_row_count:
+                conn.rollback()
+                raise ValueError(
+                    "Postgres did not report an affected row count; "
+                    "set allow_unknown_row_count=true only when that is expected"
+                )
+            if row_count is not None and row_count > max_affected_rows:
+                conn.rollback()
+                raise ValueError(
+                    f"statement affected {row_count} rows, above max_affected_rows={max_affected_rows}"
+                )
+
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+
+        committed = not dry_run
+        log.info(
+            "pg_execute finished actor=%s host=%s database=%s user=%s "
+            "statement_type=%s dry_run=%s committed=%s row_count=%s "
+            "truncated=%s sql_sha256=%s",
+            actor or "<unknown>",
+            normalized_host,
+            database,
+            user,
+            statement_type,
+            dry_run,
+            committed,
+            row_count,
+            truncated,
+            sql_sha256,
+        )
+
+        return {
+            "host": normalized_host,
+            "port": port,
+            "database": database,
+            "user": user,
+            "statement_type": statement_type,
+            "dry_run": dry_run,
+            "committed": committed,
+            "row_count": row_count,
+            "max_affected_rows": max_affected_rows,
+            "columns": columns,
+            "rows": rows,
+            "truncated": truncated,
+            "actor": actor,
+            "sql_sha256": sql_sha256,
         }

@@ -8,8 +8,9 @@ dependencies = [
     "azure-identity>=1.25.1",
     "mcp>=1.18.0",
     # psycopg[binary] vendors libpq so the slim base image doesn't need
-    # libpq-dev / apt; used by the pg_query tool to talk to Azure Postgres
-    # Flexible Server with an Entra workload-identity token as the password.
+    # libpq-dev / apt; used by the Postgres MCP tools to talk to Azure
+    # Postgres Flexible Server with an Entra workload-identity token as the
+    # password.
     "psycopg[binary]>=3.2",
     "requests>=2.32.0",
     "starlette>=0.40.0",
