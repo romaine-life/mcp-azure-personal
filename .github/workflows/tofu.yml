@@ -31,7 +31,7 @@ jobs:
     # OpenTofu 1.10) is available — that's what lets the cross-repo
     # migration with tank-operator apply atomically without a manual
     # `tofu state rm` step.
-    uses: nelsong6/pipeline-templates/.github/workflows/tofu-plan-apply-template.yml@main
+    uses: romaine-life/pipeline-templates/.github/workflows/tofu-plan-apply-template.yml@main
     with:
       working_directory: infra
       backend_resource_group: infra
