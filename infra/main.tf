@@ -6,7 +6,7 @@
 # consumes the KV secret via ExternalSecret.
 #
 # Historical note: these resources were originally defined in
-# nelsong6/tank-operator's infra/mcp.tf alongside other MCP servers. The
+# romaine-life/tank-operator's infra/mcp.tf alongside other MCP servers. The
 # companion tank-operator PR deletes them from that state (Azure destroys
 # them); merging this PR's apply afterward creates them fresh here with the
 # correct `aks_namespace = "mcp-azure-personal"`. Destroy-recreate rather
@@ -113,7 +113,7 @@ resource "azurerm_role_assignment" "tank_aks_runcommand" {
 # query otherwise. Workload-sub Reader isn't needed — the existing
 # subscription-Contributor grant already covers reads there.
 #
-# Migrated from nelsong6/infra-bootstrap/tofu/mcp-azure-personal.tf, which
+# Migrated from romaine-life/infra-bootstrap/tofu/mcp-azure-personal.tf, which
 # was deleted in infra-bootstrap#127 because its `data.azuread_service_
 # principal` pinned a tombstoned UAMI client_id from a previous destroy-
 # recreate cycle. App-specific grants belong here, not in infra-bootstrap;
@@ -162,8 +162,8 @@ resource "azurerm_postgresql_flexible_server_active_directory_administrator" "ta
 }
 
 # Same shape as tank_operator_db above, against the glimmung-pg server
-# provisioned in nelsong6/glimmung#565 (Stage 1 of the Cosmos -> Postgres
-# migration documented in nelsong6/glimmung/docs/postgres-migration.md).
+# provisioned in romaine-life/glimmung#565 (Stage 1 of the Cosmos -> Postgres
+# migration documented in romaine-life/glimmung/docs/postgres-migration.md).
 # Granted now so the Postgres MCP tools can inspect and, when explicitly
 # requested through pg_execute, repair Glimmung control-plane state.
 #

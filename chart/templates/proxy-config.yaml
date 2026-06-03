@@ -38,7 +38,7 @@ subjects:
   # Hermes (`nelsong6/hermes`) is a singleton AI-agent StatefulSet that
   # calls Tank's in-cluster MCP servers from its own pod via the same
   # mcp-auth-proxy sidecar shape Tank session pods use. See
-  # nelsong6/tank-operator#540.
+  # romaine-life/tank-operator#540.
   - kind: ServiceAccount
     name: hermes
     namespace: hermes

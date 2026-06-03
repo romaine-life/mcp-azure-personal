@@ -29,7 +29,7 @@ variable "glimmung_postgres_server_name" {
 }
 
 variable "glimmung_postgres_resource_group" {
-  description = "Resource group of the glimmung Postgres server. Per nelsong6/glimmung/tofu/identity.tf, glimmung-owned resources live in the `glimmung` resource group, not the shared `infra` RG."
+  description = "Resource group of the glimmung Postgres server. Per romaine-life/glimmung/tofu/identity.tf, glimmung-owned resources live in the `glimmung` resource group, not the shared `infra` RG."
   type        = string
   default     = "glimmung"
 }

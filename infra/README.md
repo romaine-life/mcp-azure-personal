@@ -21,13 +21,13 @@ State is stored in `nelsontofu` blob container `tfstate` under key
 
 ## Migration from tank-operator/infra
 
-These resources used to be declared in `nelsong6/tank-operator/infra/mcp.tf`
+These resources used to be declared in `romaine-life/tank-operator/infra/mcp.tf`
 inside the `mcp_azure_personal` module call. The existing FIC subject was
 stale anyway (built against the pre-rename namespace `mcp-azure`), so
 workload identity was broken — there's no live auth to preserve through
 the move. Ownership migrates via destroy-recreate:
 
-1. **Merge [nelsong6/tank-operator#508](https://github.com/nelsong6/tank-operator/pull/508) first.**
+1. **Merge [romaine-life/tank-operator#508](https://github.com/romaine-life/tank-operator/pull/508) first.**
    Its CI runs `tofu apply`; tofu destroys the UAMI, FIC, both ARM role
    assignments, the KV secret holding the UAMI client ID, and the Cosmos
    data-plane role assignment in Azure.
