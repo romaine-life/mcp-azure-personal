@@ -38,6 +38,25 @@ spec:
               value: https://login.microsoftonline.com/
             - name: AZURE_TOKEN_CREDENTIALS
               value: WorkloadIdentityCredential
+            # Azure break-glass enforcement (tank-operator azure break-glass
+            # plan, stage 3). When enforce is true the MCP surface requires an
+            # active Tank grant for the caller's session; the server mints its
+            # own role=service JWT from the projected auth.romaine.life-audience
+            # SA token (volume below) to look the grant up.
+            - name: AZURE_BREAK_GLASS_ENFORCE
+              value: "{{ .Values.breakGlass.enforce }}"
+            - name: AZURE_BREAK_GLASS_EXEMPT_SUBJECTS
+              value: "{{ .Values.breakGlass.exemptSubjects }}"
+            - name: TANK_OPERATOR_INTERNAL_URL
+              value: "{{ .Values.breakGlass.tankInternalUrl }}"
+            - name: AUTH_ROMAINE_EXCHANGE_URL
+              value: "{{ .Values.breakGlass.exchangeUrl }}"
+            - name: AUTH_ROMAINE_SA_TOKEN_FILE
+              value: /var/run/secrets/auth.romaine.life/token
+          volumeMounts:
+            - name: auth-romaine-sa-token
+              mountPath: /var/run/secrets/auth.romaine.life
+              readOnly: true
           readinessProbe:
             exec:
               command: ["python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', {{ .Values.upstreamPort }})); s.close()"]
@@ -66,3 +85,14 @@ spec:
         - name: proxy-config
           configMap:
             name: kube-rbac-proxy
+        # Projected SA token, audience-pinned to auth.romaine.life. The server
+        # exchanges it for a role=service JWT to call tank-operator's internal
+        # azure break-glass grant lookup. Distinct audience from the cluster SA
+        # token kube-rbac-proxy validates, so a stolen token can't be replayed.
+        - name: auth-romaine-sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: https://auth.romaine.life
+                  expirationSeconds: 3600
+                  path: token
