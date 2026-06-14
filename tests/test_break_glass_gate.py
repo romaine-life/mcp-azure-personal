@@ -155,10 +155,19 @@ def test_middleware_open_when_not_enforcing(signing_key):
 
 def test_middleware_denies_without_jwt_when_enforcing(signing_key):
     client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=True)))
-    r = client.post("/", headers={"x-tank-caller-session-id": "941"})
-    assert r.status_code == 403
-    assert "locked" in r.json()["error"]
-    assert "request_azure_break_glass" in r.json()["detail"]
+    r = client.post(
+        "/",
+        headers={"x-tank-caller-session-id": "941"},
+        json={"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {}},
+    )
+    # HTTP 200 with a JSON-RPC error — NOT a bare 403 (which makes the SDK
+    # OAuth-trigger). The request id is echoed so the SDK matches the error.
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == 7
+    assert body["error"]["code"] == -32010
+    assert "locked" in body["error"]["message"]
+    assert "request_azure_break_glass" in body["error"]["message"]
 
 
 def test_middleware_allows_with_jwt_and_active_grant(signing_key, monkeypatch):
@@ -180,8 +189,10 @@ def test_middleware_denies_with_jwt_but_no_active_grant(signing_key, monkeypatch
     r = client.post(
         "/",
         headers={"x-auth-romaine-token": _mint(signing_key), "x-tank-caller-session-id": "941"},
+        json={"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {}},
     )
-    assert r.status_code == 403
+    assert r.status_code == 200
+    assert r.json()["error"]["code"] == -32010
 
 
 def test_middleware_healthz_bypasses_enforcement(signing_key):

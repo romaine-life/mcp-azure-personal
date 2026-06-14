@@ -34,6 +34,7 @@ a request with no verified JWT or no active grant is refused (fail closed).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -132,9 +133,13 @@ class AzureBreakGlassMiddleware(BaseHTTPMiddleware):
 
     Runs after CallerJWTMiddleware (so the verified Caller is bound). When the
     gate is enforcing, every MCP request must be backed by an active grant for
-    the caller's session (or an exempt caller); otherwise it is refused with a
-    403 that points the agent at the request_azure_break_glass tool. /healthz
-    and the DELETE session-teardown route are never gated.
+    the caller's session (or an exempt caller); otherwise it is refused with an
+    MCP-shaped JSON-RPC error (HTTP 200) that points the agent at the
+    request_azure_break_glass tool. We deliberately do NOT return a bare HTTP
+    403: the Claude MCP SDK treats a 403 on the MCP endpoint as an OAuth
+    challenge and falls into an `authenticate`/`complete_authentication` flow
+    instead of cleanly reporting the locked state. /healthz and the DELETE
+    session-teardown route are never gated.
 
     The grant check is synchronous (it calls tank-operator over HTTP) so it runs
     in a worker thread to avoid blocking the event loop; the gate caches results
@@ -159,16 +164,31 @@ class AzureBreakGlassMiddleware(BaseHTTPMiddleware):
         session_id = request.headers.get("x-tank-caller-session-id", "").strip()
         allowed = await anyio.to_thread.run_sync(self._gate.allowed, caller, session_id)
         if not allowed:
+            # MCP-shaped JSON-RPC error at HTTP 200 — never a bare 403 (see the
+            # class docstring: a 403 makes the SDK OAuth-trigger). Echo the
+            # request's JSON-RPC id so the SDK matches the error to its call.
+            rpc_id = None
+            try:
+                payload = json.loads(await request.body())
+                if isinstance(payload, dict):
+                    rpc_id = payload.get("id")
+            except Exception:
+                rpc_id = None
             return JSONResponse(
                 {
-                    "error": "azure-personal MCP is locked",
-                    "detail": (
-                        "An approved Tank azure break-glass grant is required. Call the "
-                        "request_azure_break_glass MCP tool to get an admin approval URL; "
-                        "the tools become available for this session once a grant is active."
-                    ),
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": {
+                        "code": -32010,
+                        "message": (
+                            "azure-personal MCP is locked: an approved Tank azure "
+                            "break-glass grant is required. Call request_azure_break_glass "
+                            "for an admin approval URL; the tools activate for this session "
+                            "once a grant is approved."
+                        ),
+                    },
                 },
-                status_code=403,
+                status_code=200,
             )
         return await call_next(request)
 
