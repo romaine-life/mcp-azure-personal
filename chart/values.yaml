@@ -48,3 +48,20 @@ proxyResources:
     memory: 32Mi
   limits:
     memory: 64Mi
+
+# Azure break-glass enforcement (tank-operator azure break-glass plan, stage 3).
+# Ships inert: enforce=false keeps the MCP surface open so this PR is safe to
+# merge/deploy on its own. The cutover is a deliberate later step — flip
+# enforce to true ONLY after:
+#   1. auth.romaine.life allowlists this server's SA (namespace/SA
+#      mcp-azure-personal/mcp-azure-personal) in K8S_SERVICE_SA_ALLOWLIST so the
+#      token exchange below succeeds, and
+#   2. exemptSubjects lists Hermes's service identity (sub or actor_email), or
+#      Hermes loses its unattended Azure access at cutover.
+# exemptSubjects is a comma-separated allowlist of JWT sub/actor_email/email
+# values that bypass the grant requirement.
+breakGlass:
+  enforce: false
+  exemptSubjects: ""
+  tankInternalUrl: http://tank-operator.tank-operator.svc.cluster.local
+  exchangeUrl: https://auth.romaine.life/api/auth/exchange/k8s

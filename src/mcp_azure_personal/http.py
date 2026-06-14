@@ -16,10 +16,20 @@ Two layers gate inbound calls:
      ContextVar. Tool handlers can attribute their work to a specific
      human via Caller.display_actor.
 
-Layer 2 is OPTIONAL on the way in (no JWT means caller is "unknown"
-to this process, layer 1 is still gating connectivity), but when
-present the JWT must verify or the request is 401'd. Half-trusting
-a malformed JWT would be worse than ignoring the header entirely.
+The JWT arrives either as ``Authorization: Bearer`` (workstation/admin callers)
+or, from a Tank session pod, as the ``X-Auth-Romaine-Token`` header the
+mcp-auth-proxy sidecar injects (because kube-rbac-proxy consumes ``Authorization``
+for the SA-token check). The middleware accepts both.
+
+  3. **Azure break-glass grant** (AzureBreakGlassMiddleware): when enforcement
+     is on (``AZURE_BREAK_GLASS_ENFORCE``), the MCP surface is locked unless the
+     caller is exempt (e.g. Hermes) or tank-operator reports an active azure
+     break-glass grant for the caller's session. This is the boundary that
+     makes azure-personal break-glass-only: it denies a direct in-cluster call,
+     not just the localhost MCP path, because it lives in the server itself.
+
+Layer 2 alone is best-effort attribution. Layer 3 is the real gate; with it on,
+a request with no verified JWT or no active grant is refused (fail closed).
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import anyio
 import jwt
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -44,6 +55,7 @@ from romaine_auth import (
     default_verifier,
     warn_jwks_unreachable,
 )
+from .grant import AzureBreakGlassGate
 from .tools import register_tools
 
 log = logging.getLogger(__name__)
@@ -71,19 +83,24 @@ class CallerJWTMiddleware(BaseHTTPMiddleware):
         if request.url.path in self._BYPASS_PATHS:
             return await call_next(request)
 
-        authz = request.headers.get("authorization", "")
-        if not authz.lower().startswith("bearer "):
-            # No JWT presented. kube-rbac-proxy is still doing its job;
-            # we just don't get user attribution this call.
-            return await call_next(request)
+        # Tank session pods present the JWT as X-Auth-Romaine-Token (raw, no
+        # "Bearer " prefix) because kube-rbac-proxy consumes Authorization for
+        # the SA-token check. Workstation/admin callers use Authorization:
+        # Bearer. Accept either; the forwarded header wins when both are set.
+        token = request.headers.get("x-auth-romaine-token", "").strip()
+        if not token:
+            authz = request.headers.get("authorization", "")
+            if not authz.lower().startswith("bearer "):
+                # No JWT presented. kube-rbac-proxy is still doing its job;
+                # we just don't get user attribution this call.
+                return await call_next(request)
+            token = authz[len("bearer "):].strip()
 
         if self._verifier is None:
             # Verifier not constructed (test env or misconfig). Skip
             # verification but log so we notice in production.
             log.warning("inbound bearer present but JWT verifier not configured; skipping")
             return await call_next(request)
-
-        token = authz[len("bearer "):].strip()
         try:
             caller = self._verifier.verify(token)
         except (jwt.PyJWTError, ValueError) as exc:
@@ -110,7 +127,53 @@ class CallerJWTMiddleware(BaseHTTPMiddleware):
             CALLER.reset(token_ctx)
 
 
-def build_app() -> Starlette:
+class AzureBreakGlassMiddleware(BaseHTTPMiddleware):
+    """Lock the MCP surface behind an azure break-glass grant.
+
+    Runs after CallerJWTMiddleware (so the verified Caller is bound). When the
+    gate is enforcing, every MCP request must be backed by an active grant for
+    the caller's session (or an exempt caller); otherwise it is refused with a
+    403 that points the agent at the request_azure_break_glass tool. /healthz
+    and the DELETE session-teardown route are never gated.
+
+    The grant check is synchronous (it calls tank-operator over HTTP) so it runs
+    in a worker thread to avoid blocking the event loop; the gate caches results
+    so steady-state calls do not hit the network.
+    """
+
+    _BYPASS_PATHS = frozenset({"/healthz"})
+
+    def __init__(self, app, gate: AzureBreakGlassGate):
+        super().__init__(app)
+        self._gate = gate
+
+    async def dispatch(self, request: Request, call_next):
+        if (
+            not self._gate.enforce
+            or request.method == "DELETE"
+            or request.url.path in self._BYPASS_PATHS
+        ):
+            return await call_next(request)
+
+        caller = CALLER.get()
+        session_id = request.headers.get("x-tank-caller-session-id", "").strip()
+        allowed = await anyio.to_thread.run_sync(self._gate.allowed, caller, session_id)
+        if not allowed:
+            return JSONResponse(
+                {
+                    "error": "azure-personal MCP is locked",
+                    "detail": (
+                        "An approved Tank azure break-glass grant is required. Call the "
+                        "request_azure_break_glass MCP tool to get an admin approval URL; "
+                        "the tools become available for this session once a grant is active."
+                    ),
+                },
+                status_code=403,
+            )
+        return await call_next(request)
+
+
+def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
     mcp = FastMCP(
         "azure-personal-mcp",
         stateless_http=True,
@@ -141,6 +204,12 @@ def build_app() -> Starlette:
     # CallerJWTMiddleware) and the absence of a JWT on subsequent
     # requests is tolerated.
     verifier = default_verifier()
+    if gate is None:
+        gate = AzureBreakGlassGate.from_env()
+    if gate.enforce:
+        log.info("azure break-glass enforcement is ON; MCP surface requires an active grant")
+    else:
+        log.warning("azure break-glass enforcement is OFF; MCP surface is open")
 
     return Starlette(
         routes=[
@@ -148,8 +217,11 @@ def build_app() -> Starlette:
             Route("/", delete_session, methods=["DELETE"]),
             Mount("/", app=mcp.streamable_http_app()),
         ],
+        # Order matters: CallerJWTMiddleware (outermost) verifies the JWT and
+        # binds the Caller, then AzureBreakGlassMiddleware enforces the grant.
         middleware=[
             Middleware(CallerJWTMiddleware, verifier=verifier),
+            Middleware(AzureBreakGlassMiddleware, gate=gate),
         ],
         lifespan=lifespan,
     )
