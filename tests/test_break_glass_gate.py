@@ -214,3 +214,40 @@ def test_middleware_exempt_caller_allowed_without_grant(signing_key, monkeypatch
         },
     )
     assert r.status_code == 200
+
+
+def test_middleware_locked_allows_initialize_handshake(signing_key):
+    # Locked = connected-but-tool-less: initialize is synthesized so the MCP
+    # client connects cleanly (no error, no OAuth-trigger). A reconnect after a
+    # grant then re-runs the real handshake + lists the real tools.
+    client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=True)))
+    r = client.post(
+        "/",
+        headers={"x-tank-caller-session-id": "941"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "c", "version": "1"}},
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == 1
+    assert body["result"]["protocolVersion"] == "2025-06-18"
+    assert "tools" in body["result"]["capabilities"]
+    assert "error" not in body
+
+
+def test_middleware_locked_returns_empty_tools_list(signing_key):
+    client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=True)))
+    r = client.post(
+        "/",
+        headers={"x-tank-caller-session-id": "941"},
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == 2
+    assert body["result"]["tools"] == []
+    assert "error" not in body
