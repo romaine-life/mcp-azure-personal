@@ -1,40 +1,39 @@
-"""HTTP entrypoint for the personal Azure MCP server — streamable-http
-transport, layered auth.
+"""HTTP entrypoint for the personal Azure MCP server — stateful streamable-http,
+layered auth, break-glass-gated tools that surface live on grant.
 
-Two layers gate inbound calls:
+Auth layers:
+  1. **kube-rbac-proxy** (in front of this process): validates the caller's K8s
+     SA token via TokenReview + SubjectAccessReview. Binds loopback so direct
+     pod-IP access bypasses nothing.
+  2. **auth.romaine.life JWT** (CallerJWTMiddleware): verifies the inbound JWT
+     against the IdP JWKS and binds the resolved Caller to a ContextVar for tool
+     attribution. Arrives as ``Authorization: Bearer`` (workstation/admin) or the
+     ``X-Auth-Romaine-Token`` header the mcp-auth-proxy sidecar injects.
+  3. **Azure break-glass grant** (the real gate): enforced *inside* the MCP tool
+     handlers, not as a blanket request middleware — so the MCP connection can
+     stay healthy and stateful while the tools themselves are hidden + locked.
 
-  1. **kube-rbac-proxy** (in front of this process): validates the
-     caller's K8s SA token via TokenReview + SubjectAccessReview.
-     "Some pod with an allowed SA is talking to me" — no human
-     identity. Binding loopback so direct pod-IP:8080 access bypasses
-     nothing.
+Break-glass surfacing model (why this server is stateful):
+  - The server runs **stateful** streamable-http and advertises
+    ``tools.listChanged``.
+  - While a session has no active grant, ``list_tools`` returns **zero** tools
+    and ``call_tool`` refuses with a JSON-RPC ``-32010``. (The mcp-auth-proxy
+    still injects the ``request_azure_break_glass`` tool into the tools/list it
+    forwards, so the agent always knows how to ask.) The connection is healthy.
+  - On grant, the orchestrator POSTs ``/internal/grant-activated {session_id}``;
+    the server fires ``notifications/tools/list_changed`` on that session's
+    stream. The Claude MCP client auto-refreshes tools/list — which now returns
+    the real tools — so they surface **live**, no reconnect, no restart. This is
+    the SDK's native dynamic-tools path; empirically it is the mechanism that
+    works (a mid-session reconnect does not re-register tools).
 
-  2. **auth.romaine.life JWT** (in this process): if the caller also
-     presents an Authorization: Bearer JWT signed by auth.romaine.life,
-     CallerJWTMiddleware verifies it against the IdP's JWKS and binds
-     the resolved Caller (sub, email, role, actor_email) to a
-     ContextVar. Tool handlers can attribute their work to a specific
-     human via Caller.display_actor.
-
-The JWT arrives either as ``Authorization: Bearer`` (workstation/admin callers)
-or, from a Tank session pod, as the ``X-Auth-Romaine-Token`` header the
-mcp-auth-proxy sidecar injects (because kube-rbac-proxy consumes ``Authorization``
-for the SA-token check). The middleware accepts both.
-
-  3. **Azure break-glass grant** (AzureBreakGlassMiddleware): when enforcement
-     is on (``AZURE_BREAK_GLASS_ENFORCE``), the MCP surface is locked unless the
-     caller is exempt (e.g. Hermes) or tank-operator reports an active azure
-     break-glass grant for the caller's session. This is the boundary that
-     makes azure-personal break-glass-only: it denies a direct in-cluster call,
-     not just the localhost MCP path, because it lives in the server itself.
-
-Layer 2 alone is best-effort attribution. Layer 3 is the real gate; with it on,
-a request with no verified JWT or no active grant is refused (fail closed).
+Layer 2 alone is best-effort attribution. Layer 3 is the boundary: a request
+with no verified JWT or no active grant gets zero tools and refused calls
+(fail closed).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -42,7 +41,11 @@ from contextlib import asynccontextmanager
 import anyio
 import jwt
 from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel.server import NotificationOptions
+from mcp.server.session import ServerSession
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -60,6 +63,15 @@ from .grant import AzureBreakGlassGate
 from .tools import register_tools
 
 log = logging.getLogger(__name__)
+
+# JSON-RPC error returned for a call while locked. Deliberately NOT a bare HTTP
+# 403: the Claude MCP SDK treats a 403 on the MCP endpoint as an OAuth challenge.
+_LOCKED_CODE = -32010
+_LOCKED_MESSAGE = (
+    "azure-personal MCP is locked: an approved Tank azure break-glass grant is "
+    "required. Call request_azure_break_glass for an admin approval URL; the "
+    "tools surface for this session automatically once a grant is approved."
+)
 
 
 class CallerJWTMiddleware(BaseHTTPMiddleware):
@@ -128,112 +140,12 @@ class CallerJWTMiddleware(BaseHTTPMiddleware):
             CALLER.reset(token_ctx)
 
 
-class AzureBreakGlassMiddleware(BaseHTTPMiddleware):
-    """Lock the MCP surface behind an azure break-glass grant.
-
-    Runs after CallerJWTMiddleware (so the verified Caller is bound). When the
-    gate is enforcing, every MCP request must be backed by an active grant for
-    the caller's session (or an exempt caller); otherwise it is refused with an
-    MCP-shaped JSON-RPC error (HTTP 200) that points the agent at the
-    request_azure_break_glass tool. We deliberately do NOT return a bare HTTP
-    403: the Claude MCP SDK treats a 403 on the MCP endpoint as an OAuth
-    challenge and falls into an `authenticate`/`complete_authentication` flow
-    instead of cleanly reporting the locked state. /healthz and the DELETE
-    session-teardown route are never gated.
-
-    The grant check is synchronous (it calls tank-operator over HTTP) so it runs
-    in a worker thread to avoid blocking the event loop; the gate caches results
-    so steady-state calls do not hit the network.
-    """
-
-    _BYPASS_PATHS = frozenset({"/healthz"})
-
-    def __init__(self, app, gate: AzureBreakGlassGate):
-        super().__init__(app)
-        self._gate = gate
-
-    async def dispatch(self, request: Request, call_next):
-        if (
-            not self._gate.enforce
-            or request.method == "DELETE"
-            or request.url.path in self._BYPASS_PATHS
-        ):
-            return await call_next(request)
-
-        caller = CALLER.get()
-        session_id = request.headers.get("x-tank-caller-session-id", "").strip()
-        allowed = await anyio.to_thread.run_sync(self._gate.allowed, caller, session_id)
-        if allowed:
-            # Granted: pass straight through to the real MCP app (body untouched,
-            # real handshake + real tools/list). A break-glass reconnect after a
-            # grant lands here and surfaces the tools.
-            return await call_next(request)
-
-        # Locked. Synthesize MCP responses by method so the client connects
-        # cleanly with ZERO tools — no error, no OAuth-trigger. azure-personal
-        # stays in the session's .mcp.json from boot; while locked it is a
-        # connected-but-tool-less server, and a reconnectMcpServer call after an
-        # approved grant re-runs this dispatch with allowed=True, surfacing the
-        # real tools live. We never call_next while locked, so the request body
-        # is read only here (avoids BaseHTTPMiddleware draining it downstream).
-        method = None
-        rpc_id = None
-        proto = "2025-06-18"
-        try:
-            payload = json.loads(await request.body())
-            if isinstance(payload, dict):
-                method = payload.get("method")
-                rpc_id = payload.get("id")
-                params = payload.get("params")
-                if isinstance(params, dict) and params.get("protocolVersion"):
-                    proto = str(params["protocolVersion"])
-        except Exception:
-            pass
-
-        if method == "initialize":
-            return JSONResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "result": {
-                        "protocolVersion": proto,
-                        "capabilities": {"tools": {"listChanged": False}},
-                        "serverInfo": {"name": "azure-personal-mcp", "version": "0.0.0"},
-                    },
-                },
-                status_code=200,
-            )
-        if isinstance(method, str) and method.startswith("notifications/"):
-            return Response(status_code=202)
-        if method == "tools/list":
-            return JSONResponse(
-                {"jsonrpc": "2.0", "id": rpc_id, "result": {"tools": []}},
-                status_code=200,
-            )
-        # tools/call (and anything else) while locked: clean MCP-shaped refusal
-        # at HTTP 200 — never a bare 403, which the SDK treats as an OAuth challenge.
-        return JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "error": {
-                    "code": -32010,
-                    "message": (
-                        "azure-personal MCP is locked: an approved Tank azure "
-                        "break-glass grant is required. Call request_azure_break_glass "
-                        "for an admin approval URL; the tools surface for this session "
-                        "once a grant is approved."
-                    ),
-                },
-            },
-            status_code=200,
-        )
-
-
 def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
     mcp = FastMCP(
         "azure-personal-mcp",
-        stateless_http=True,
+        # Stateful: the server keeps a per-session stream it can push
+        # notifications/tools/list_changed on. Required for live surfacing.
+        stateless_http=False,
         streamable_http_path="/",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=False,
@@ -241,45 +153,141 @@ def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
     )
     register_tools(mcp)
 
+    # FastMCP advertises tools.listChanged=False by default (its
+    # create_initialization_options() uses NotificationOptions(tools_changed=
+    # False)). Force it True so the MCP client subscribes to
+    # notifications/tools/list_changed — without this the client ignores the
+    # surfacing notification and the tools never appear on grant.
+    _orig_init_opts = mcp._mcp_server.create_initialization_options
+
+    def _init_opts_tools_changed(notification_options=None, *args, **kwargs):
+        return _orig_init_opts(
+            notification_options or NotificationOptions(tools_changed=True),
+            *args,
+            **kwargs,
+        )
+
+    mcp._mcp_server.create_initialization_options = _init_opts_tools_changed
+
+    # JWT verifier shared across all inbound requests. Construction touches no
+    # network (PyJWKClient defers JWKS fetch until first verify).
+    verifier = default_verifier()
+    if gate is None:
+        gate = AzureBreakGlassGate.from_env()
+    if gate.enforce:
+        log.info("azure break-glass enforcement is ON; tools hidden+locked until a grant")
+    else:
+        log.warning("azure break-glass enforcement is OFF; MCP surface is open")
+
+    # tank session_id -> the live ServerSession, captured on tools/list. Lets
+    # /internal/grant-activated fire tools/list_changed on the exact session
+    # whose grant just went active. Same event loop as the MCP handlers, so a
+    # plain dict needs no lock.
+    sessions: dict[str, ServerSession] = {}
+
+    def _session_id(request: Request | None) -> str:
+        if request is None:
+            return ""
+        return (request.headers.get("x-tank-caller-session-id", "") or "").strip()
+
+    async def _grant_allowed(request: Request | None) -> bool:
+        """Active-grant check for the request's session. Fail closed.
+
+        Re-resolves the caller from the request's own headers rather than the
+        CALLER ContextVar: in stateful streamable-http the tool handler runs in
+        the session's task, whose context is the *session-open* request — so the
+        per-request ContextVar is not guaranteed to be the current caller. The
+        headers on ``request_context.request`` always are.
+        """
+        if not gate.enforce:
+            return True
+        if request is None:
+            return False
+        session_id = _session_id(request)
+        token = (request.headers.get("x-auth-romaine-token", "") or "").strip()
+        if not token:
+            authz = request.headers.get("authorization", "")
+            if authz.lower().startswith("bearer "):
+                token = authz[len("bearer "):].strip()
+        caller = None
+        if token and verifier is not None:
+            try:
+                caller = verifier.verify(token)
+            except Exception:
+                caller = None
+        # gate.allowed is synchronous (HTTP to tank-operator, cached); off-thread.
+        return await anyio.to_thread.run_sync(gate.allowed, caller, session_id)
+
+    @mcp._mcp_server.list_tools()
+    async def list_tools_gated():
+        # Overrides FastMCP's default list_tools: capture the session for
+        # out-of-band notification, then gate visibility on the grant.
+        ctx = mcp.get_context()
+        request = ctx.request_context.request
+        session_id = _session_id(request)
+        if session_id and ctx.session is not None:
+            sessions[session_id] = ctx.session
+        if await _grant_allowed(request):
+            return await mcp.list_tools()
+        return []  # locked: zero real tools (proxy injects request_azure_break_glass)
+
+    @mcp._mcp_server.call_tool(validate_input=False)
+    async def call_tool_gated(name: str, arguments: dict):
+        # Defense in depth: while locked the tools aren't listed, but refuse a
+        # cached/guessed call too.
+        ctx = mcp.get_context()
+        if not await _grant_allowed(ctx.request_context.request):
+            raise McpError(ErrorData(code=_LOCKED_CODE, message=_LOCKED_MESSAGE))
+        return await mcp.call_tool(name, arguments)
+
+    async def grant_activated(request: Request) -> Response:
+        """Event-driven surfacing trigger.
+
+        The orchestrator POSTs ``{"session_id": "..."}`` the moment an azure
+        break-glass grant goes active. We fire tools/list_changed on that
+        session's stream so the MCP client re-fetches tools/list (which now
+        returns the real tools). Not security-sensitive: it only nudges a
+        re-list, and list_tools re-checks the grant — so this can never surface
+        tools for a session that does not actually hold a grant.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        session_id = str((body or {}).get("session_id", "") or "").strip()
+        if not session_id:
+            return JSONResponse({"ok": False, "reason": "session_id required"}, status_code=400)
+        session = sessions.get(session_id)
+        if session is None:
+            return JSONResponse(
+                {"ok": False, "reason": "no connected MCP session for session_id"},
+                status_code=404,
+            )
+        try:
+            await session.send_tool_list_changed()
+        except Exception as exc:
+            log.warning("grant-activated: send_tool_list_changed failed for %s: %s", session_id, exc)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+        log.info("grant-activated: fired tools/list_changed for session %s", session_id)
+        return JSONResponse({"ok": True})
+
     async def healthz(_: Request) -> Response:
         return Response("ok", media_type="text/plain")
-
-    async def delete_session(_: Request) -> Response:
-        # FastMCP stateless mode returns 405 for DELETE, but Claude Code's MCP
-        # client treats 405 as fatal. Return 200 so it can reconnect cleanly.
-        return Response(status_code=200)
 
     @asynccontextmanager
     async def lifespan(_app: Starlette):
         async with mcp.session_manager.run():
             yield
 
-    # JWT verifier shared across all inbound requests. Construction
-    # touches no network — PyJWKClient defers JWKS fetch until first
-    # verify — so it's safe at import time. If env points it at a
-    # broken JWKS URL, the first verify fails with 503 (handled in
-    # CallerJWTMiddleware) and the absence of a JWT on subsequent
-    # requests is tolerated.
-    verifier = default_verifier()
-    if gate is None:
-        gate = AzureBreakGlassGate.from_env()
-    if gate.enforce:
-        log.info("azure break-glass enforcement is ON; MCP surface requires an active grant")
-    else:
-        log.warning("azure break-glass enforcement is OFF; MCP surface is open")
-
     return Starlette(
         routes=[
             Route("/healthz", healthz),
-            Route("/", delete_session, methods=["DELETE"]),
+            Route("/internal/grant-activated", grant_activated, methods=["POST"]),
+            # Stateful streamable-http handles GET (SSE), POST, and DELETE
+            # (session teardown) itself — no custom DELETE shim needed.
             Mount("/", app=mcp.streamable_http_app()),
         ],
-        # Order matters: CallerJWTMiddleware (outermost) verifies the JWT and
-        # binds the Caller, then AzureBreakGlassMiddleware enforces the grant.
-        middleware=[
-            Middleware(CallerJWTMiddleware, verifier=verifier),
-            Middleware(AzureBreakGlassMiddleware, gate=gate),
-        ],
+        middleware=[Middleware(CallerJWTMiddleware, verifier=verifier)],
         lifespan=lifespan,
     )
 
