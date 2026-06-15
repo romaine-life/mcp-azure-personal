@@ -163,34 +163,71 @@ class AzureBreakGlassMiddleware(BaseHTTPMiddleware):
         caller = CALLER.get()
         session_id = request.headers.get("x-tank-caller-session-id", "").strip()
         allowed = await anyio.to_thread.run_sync(self._gate.allowed, caller, session_id)
-        if not allowed:
-            # MCP-shaped JSON-RPC error at HTTP 200 — never a bare 403 (see the
-            # class docstring: a 403 makes the SDK OAuth-trigger). Echo the
-            # request's JSON-RPC id so the SDK matches the error to its call.
-            rpc_id = None
-            try:
-                payload = json.loads(await request.body())
-                if isinstance(payload, dict):
-                    rpc_id = payload.get("id")
-            except Exception:
-                rpc_id = None
+        if allowed:
+            # Granted: pass straight through to the real MCP app (body untouched,
+            # real handshake + real tools/list). A break-glass reconnect after a
+            # grant lands here and surfaces the tools.
+            return await call_next(request)
+
+        # Locked. Synthesize MCP responses by method so the client connects
+        # cleanly with ZERO tools — no error, no OAuth-trigger. azure-personal
+        # stays in the session's .mcp.json from boot; while locked it is a
+        # connected-but-tool-less server, and a reconnectMcpServer call after an
+        # approved grant re-runs this dispatch with allowed=True, surfacing the
+        # real tools live. We never call_next while locked, so the request body
+        # is read only here (avoids BaseHTTPMiddleware draining it downstream).
+        method = None
+        rpc_id = None
+        proto = "2025-06-18"
+        try:
+            payload = json.loads(await request.body())
+            if isinstance(payload, dict):
+                method = payload.get("method")
+                rpc_id = payload.get("id")
+                params = payload.get("params")
+                if isinstance(params, dict) and params.get("protocolVersion"):
+                    proto = str(params["protocolVersion"])
+        except Exception:
+            pass
+
+        if method == "initialize":
             return JSONResponse(
                 {
                     "jsonrpc": "2.0",
                     "id": rpc_id,
-                    "error": {
-                        "code": -32010,
-                        "message": (
-                            "azure-personal MCP is locked: an approved Tank azure "
-                            "break-glass grant is required. Call request_azure_break_glass "
-                            "for an admin approval URL; the tools activate for this session "
-                            "once a grant is approved."
-                        ),
+                    "result": {
+                        "protocolVersion": proto,
+                        "capabilities": {"tools": {"listChanged": False}},
+                        "serverInfo": {"name": "azure-personal-mcp", "version": "0.0.0"},
                     },
                 },
                 status_code=200,
             )
-        return await call_next(request)
+        if isinstance(method, str) and method.startswith("notifications/"):
+            return Response(status_code=202)
+        if method == "tools/list":
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": rpc_id, "result": {"tools": []}},
+                status_code=200,
+            )
+        # tools/call (and anything else) while locked: clean MCP-shaped refusal
+        # at HTTP 200 — never a bare 403, which the SDK treats as an OAuth challenge.
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": {
+                    "code": -32010,
+                    "message": (
+                        "azure-personal MCP is locked: an approved Tank azure "
+                        "break-glass grant is required. Call request_azure_break_glass "
+                        "for an admin approval URL; the tools surface for this session "
+                        "once a grant is approved."
+                    ),
+                },
+            },
+            status_code=200,
+        )
 
 
 def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
