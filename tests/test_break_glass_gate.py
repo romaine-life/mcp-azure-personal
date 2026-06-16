@@ -188,19 +188,79 @@ def test_healthz_ok():
         assert r.text == "ok"
 
 
-def test_grant_activated_requires_session_id():
-    with TestClient(build_app(AzureBreakGlassGate(enforce=True))) as client:
-        r = client.post("/internal/grant-activated", json={})
+def test_grant_activated_requires_session_id(signing_key):
+    with TestClient(
+        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
+    ) as client:
+        r = client.post(
+            "/internal/grant-activated",
+            json={},
+            headers={"x-auth-romaine-token": _mint(signing_key)},
+        )
         assert r.status_code == 400
         assert r.json()["ok"] is False
 
 
-def test_grant_activated_unknown_session_is_404():
+def test_grant_activated_unknown_session_is_404(signing_key):
     # No MCP session has connected, so there is nothing to notify.
-    with TestClient(build_app(AzureBreakGlassGate(enforce=True))) as client:
-        r = client.post("/internal/grant-activated", json={"session_id": "no-such-session"})
+    with TestClient(
+        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
+    ) as client:
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "no-such-session"},
+            headers={"x-auth-romaine-token": _mint(signing_key)},
+        )
         assert r.status_code == 404
         assert r.json()["ok"] is False
+
+
+def test_grant_activated_requires_jwt(signing_key):
+    # /internal/grant-activated is off the kube-rbac SA gate, so a missing
+    # auth.romaine.life JWT (caller=None) must be rejected, not waved through.
+    with TestClient(
+        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
+    ) as client:
+        r = client.post("/internal/grant-activated", json={"session_id": "941"})
+        assert r.status_code == 401
+        assert r.json()["ok"] is False
+
+
+def test_grant_activated_rejects_non_service_role(signing_key):
+    with TestClient(
+        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
+    ) as client:
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "941"},
+            headers={"x-auth-romaine-token": _mint(signing_key, role="user")},
+        )
+        assert r.status_code == 403
+
+
+def test_grant_activated_enforces_principal_allowlist(signing_key):
+    app = build_app(
+        AzureBreakGlassGate(enforce=True),
+        verifier=_verifier(signing_key),
+        grant_activated_principals=frozenset({"svc:tank-operator:orchestrator"}),
+    )
+    with TestClient(app) as client:
+        # A valid service JWT that is NOT the allowed principal is rejected.
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "941"},
+            headers={"x-auth-romaine-token": _mint(signing_key, sub="u-1")},
+        )
+        assert r.status_code == 403
+        # The orchestrator principal passes the gate (then 404 — no live session).
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "941"},
+            headers={
+                "x-auth-romaine-token": _mint(signing_key, sub="svc:tank-operator:orchestrator")
+            },
+        )
+        assert r.status_code == 404
 
 
 def test_server_advertises_tools_list_changed():
