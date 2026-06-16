@@ -140,7 +140,11 @@ class CallerJWTMiddleware(BaseHTTPMiddleware):
             CALLER.reset(token_ctx)
 
 
-def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
+def build_app(
+    gate: AzureBreakGlassGate | None = None,
+    verifier: AuthRomaineLifeVerifier | None = None,
+    grant_activated_principals: frozenset[str] | None = None,
+) -> Starlette:
     mcp = FastMCP(
         "azure-personal-mcp",
         # Stateful: the server keeps a per-session stream it can push
@@ -171,9 +175,20 @@ def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
 
     # JWT verifier shared across all inbound requests. Construction touches no
     # network (PyJWKClient defers JWKS fetch until first verify).
-    verifier = default_verifier()
+    if verifier is None:
+        verifier = default_verifier()
     if gate is None:
         gate = AzureBreakGlassGate.from_env()
+    # /internal/grant-activated is taken OUT of the kube-rbac-proxy SA gate (the
+    # chart adds it to --ignore-paths), so the auth.romaine.life service JWT is
+    # the gate there instead. An empty allowlist still requires a valid
+    # role=service caller; the chart pins this to the orchestrator's principal.
+    if grant_activated_principals is None:
+        grant_activated_principals = frozenset(
+            p.strip()
+            for p in os.environ.get("AZURE_GRANT_ACTIVATED_PRINCIPALS", "").split(",")
+            if p.strip()
+        )
     if gate.enforce:
         log.info("azure break-glass enforcement is ON; tools hidden+locked until a grant")
     else:
@@ -249,7 +264,36 @@ def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
         returns the real tools). Not security-sensitive: it only nudges a
         re-list, and list_tools re-checks the grant — so this can never surface
         tools for a session that does not actually hold a grant.
+
+        Auth: this route is in the kube-rbac-proxy --ignore-paths, so the
+        auth.romaine.life service JWT is the only gate. CallerJWTMiddleware is
+        best-effort (a missing JWT arrives as caller=None), so enforce here.
         """
+        caller = CALLER.get()
+        if caller is None:
+            return JSONResponse(
+                {"ok": False, "reason": "auth.romaine.life service JWT required"},
+                status_code=401,
+            )
+        if getattr(caller, "role", None) != "service":
+            return JSONResponse(
+                {"ok": False, "reason": "requires role=service"}, status_code=403
+            )
+        if grant_activated_principals:
+            identities = {
+                (getattr(caller, "sub", "") or "").strip(),
+                (getattr(caller, "actor_email", "") or "").strip(),
+                (getattr(caller, "email", "") or "").strip(),
+            }
+            if not (identities & grant_activated_principals):
+                log.info(
+                    "grant-activated: rejected caller sub=%s (not an allowed principal)",
+                    getattr(caller, "sub", None),
+                )
+                return JSONResponse(
+                    {"ok": False, "reason": "caller not an allowed grant-activated principal"},
+                    status_code=403,
+                )
         try:
             body = await request.json()
         except Exception:
