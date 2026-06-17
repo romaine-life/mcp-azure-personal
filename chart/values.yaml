@@ -64,7 +64,3 @@ breakGlass:
   exemptSubjects: ""
   tankInternalUrl: http://tank-operator.tank-operator.svc.cluster.local
   exchangeUrl: https://auth.romaine.life/api/auth/exchange/k8s
-  # auth.romaine.life service principals (sub or email) allowed to POST
-  # /internal/grant-activated. Pinned to the tank-operator orchestrator, which
-  # fires it the moment an azure break-glass grant goes active.
-  grantActivatedPrincipals: svc:tank-operator:orchestrator
