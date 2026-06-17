@@ -1,18 +1,9 @@
 """Tests for azure break-glass grant enforcement.
 
-Covers:
-  - the gate's decision logic (exempt callers, missing JWT/session,
-    active/inactive grants, caching, fail-closed);
-  - CallerJWTMiddleware binding the verified Caller;
-  - build_app's surface: the routes, the /internal/grant-activated event
-    endpoint, and that the server advertises tools.listChanged (so the MCP
-    client subscribes to the surfacing notification).
-
-The break-glass gate now lives INSIDE the MCP tool handlers (list_tools returns
-zero tools while locked; call_tool refuses), not a standalone request
-middleware. The end-to-end "locked -> grant -> tools surface live" behaviour is
-exercised against the real Claude Agent SDK in the lab harness; here we cover
-the units around it.
+Covers the gate's decision logic (exempt callers, missing JWT/session,
+active/inactive grants, caching, fail-closed) and the middleware that turns a
+denied decision into a 403 — wired behind the real CallerJWTMiddleware so the
+X-Auth-Romaine-Token header path is exercised end to end.
 """
 
 from __future__ import annotations
@@ -31,7 +22,7 @@ from starlette.testclient import TestClient
 
 from romaine_auth import CALLER, AuthRomaineLifeVerifier, Caller
 from mcp_azure_personal.grant import AzureBreakGlassGate
-from mcp_azure_personal.http import CallerJWTMiddleware, build_app
+from mcp_azure_personal.http import AzureBreakGlassMiddleware, CallerJWTMiddleware
 
 
 @pytest.fixture(scope="module")
@@ -89,7 +80,23 @@ def _caller(**kw) -> Caller:
     return Caller(**base)
 
 
-# --- gate decision logic (grant.py, unchanged) ---
+def _build_app(signing_key, gate: AzureBreakGlassGate) -> Starlette:
+    async def ok(_: Request) -> JSONResponse:
+        return JSONResponse({"ok": True, "caller": getattr(CALLER.get(), "actor_email", None)})
+
+    async def healthz(_: Request) -> JSONResponse:
+        return JSONResponse({"ok": True})
+
+    return Starlette(
+        routes=[Route("/", ok, methods=["POST"]), Route("/healthz", healthz)],
+        middleware=[
+            Middleware(CallerJWTMiddleware, verifier=_verifier(signing_key)),
+            Middleware(AzureBreakGlassMiddleware, gate=gate),
+        ],
+    )
+
+
+# --- gate decision logic ---
 
 
 def test_gate_disabled_allows_everything():
@@ -138,150 +145,109 @@ def test_gate_fails_closed_on_lookup_error(monkeypatch):
     assert gate.allowed(_caller(), "941") is False
 
 
-# --- CallerJWTMiddleware (binds the verified caller) ---
+# --- middleware enforcement ---
 
 
-def _jwt_app(signing_key) -> Starlette:
-    async def whoami(_: Request) -> JSONResponse:
-        return JSONResponse({"caller": getattr(CALLER.get(), "actor_email", None)})
+def test_middleware_open_when_not_enforcing(signing_key):
+    client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=False)))
+    assert client.post("/").status_code == 200
 
-    return Starlette(
-        routes=[Route("/", whoami, methods=["POST"]), Route("/healthz", whoami)],
-        middleware=[Middleware(CallerJWTMiddleware, verifier=_verifier(signing_key))],
+
+def test_middleware_denies_without_jwt_when_enforcing(signing_key):
+    client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=True)))
+    r = client.post(
+        "/",
+        headers={"x-tank-caller-session-id": "941"},
+        json={"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {}},
     )
+    # HTTP 200 with a JSON-RPC error — NOT a bare 403 (which makes the SDK
+    # OAuth-trigger). The request id is echoed so the SDK matches the error.
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == 7
+    assert body["error"]["code"] == -32010
+    assert "locked" in body["error"]["message"]
+    assert "request_azure_break_glass" in body["error"]["message"]
 
 
-def test_caller_jwt_binds_verified_caller(signing_key):
-    client = TestClient(_jwt_app(signing_key))
-    r = client.post("/", headers={"x-auth-romaine-token": _mint(signing_key)})
+def test_middleware_allows_with_jwt_and_active_grant(signing_key, monkeypatch):
+    gate = AzureBreakGlassGate(enforce=True)
+    monkeypatch.setattr(gate, "_lookup_grant", lambda sid: True)
+    client = TestClient(_build_app(signing_key, gate))
+    r = client.post(
+        "/",
+        headers={"x-auth-romaine-token": _mint(signing_key), "x-tank-caller-session-id": "941"},
+    )
     assert r.status_code == 200
     assert r.json()["caller"] == "owner@example.com"
 
 
-def test_caller_jwt_absent_proceeds_without_caller(signing_key):
-    client = TestClient(_jwt_app(signing_key))
-    r = client.post("/")
+def test_middleware_denies_with_jwt_but_no_active_grant(signing_key, monkeypatch):
+    gate = AzureBreakGlassGate(enforce=True)
+    monkeypatch.setattr(gate, "_lookup_grant", lambda sid: False)
+    client = TestClient(_build_app(signing_key, gate))
+    r = client.post(
+        "/",
+        headers={"x-auth-romaine-token": _mint(signing_key), "x-tank-caller-session-id": "941"},
+        json={"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {}},
+    )
     assert r.status_code == 200
-    assert r.json()["caller"] is None
+    assert r.json()["error"]["code"] == -32010
 
 
-def test_caller_jwt_rejects_malformed_token(signing_key):
-    client = TestClient(_jwt_app(signing_key))
-    r = client.post("/", headers={"x-auth-romaine-token": "not-a-jwt"})
-    assert r.status_code == 401
+def test_middleware_healthz_bypasses_enforcement(signing_key):
+    client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=True)))
+    assert client.get("/healthz").status_code == 200
 
 
-# --- build_app surface ---
-
-
-def test_build_app_exposes_expected_routes():
-    app = build_app(AzureBreakGlassGate(enforce=True))
-    paths = {getattr(r, "path", None) for r in app.routes}
-    assert "/healthz" in paths
-    assert "/internal/grant-activated" in paths
-
-
-def test_healthz_ok():
-    with TestClient(build_app(AzureBreakGlassGate(enforce=True))) as client:
-        r = client.get("/healthz")
-        assert r.status_code == 200
-        assert r.text == "ok"
-
-
-def test_grant_activated_requires_session_id(signing_key):
-    with TestClient(
-        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
-    ) as client:
-        r = client.post(
-            "/internal/grant-activated",
-            json={},
-            headers={"x-auth-romaine-token": _mint(signing_key)},
-        )
-        assert r.status_code == 400
-        assert r.json()["ok"] is False
-
-
-def test_grant_activated_unknown_session_is_404(signing_key):
-    # No MCP session has connected, so there is nothing to notify.
-    with TestClient(
-        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
-    ) as client:
-        r = client.post(
-            "/internal/grant-activated",
-            json={"session_id": "no-such-session"},
-            headers={"x-auth-romaine-token": _mint(signing_key)},
-        )
-        assert r.status_code == 404
-        assert r.json()["ok"] is False
-
-
-def test_grant_activated_requires_jwt(signing_key):
-    # /internal/grant-activated is off the kube-rbac SA gate, so a missing
-    # auth.romaine.life JWT (caller=None) must be rejected, not waved through.
-    with TestClient(
-        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
-    ) as client:
-        r = client.post("/internal/grant-activated", json={"session_id": "941"})
-        assert r.status_code == 401
-        assert r.json()["ok"] is False
-
-
-def test_grant_activated_rejects_non_service_role(signing_key):
-    with TestClient(
-        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
-    ) as client:
-        r = client.post(
-            "/internal/grant-activated",
-            json={"session_id": "941"},
-            headers={"x-auth-romaine-token": _mint(signing_key, role="user")},
-        )
-        assert r.status_code == 403
-
-
-def test_grant_activated_enforces_principal_allowlist(signing_key):
-    app = build_app(
-        AzureBreakGlassGate(enforce=True),
-        verifier=_verifier(signing_key),
-        grant_activated_principals=frozenset({"svc:tank-operator:orchestrator"}),
+def test_middleware_exempt_caller_allowed_without_grant(signing_key, monkeypatch):
+    gate = AzureBreakGlassGate(enforce=True, exempt_subjects=frozenset({"owner@example.com"}))
+    monkeypatch.setattr(
+        gate, "_lookup_grant", lambda sid: (_ for _ in ()).throw(AssertionError("no lookup"))
     )
-    with TestClient(app) as client:
-        # A valid service JWT that is NOT the allowed principal is rejected.
-        r = client.post(
-            "/internal/grant-activated",
-            json={"session_id": "941"},
-            headers={"x-auth-romaine-token": _mint(signing_key, sub="u-1")},
-        )
-        assert r.status_code == 403
-        # The orchestrator principal passes the gate (then 404 — no live session).
-        r = client.post(
-            "/internal/grant-activated",
-            json={"session_id": "941"},
-            headers={
-                "x-auth-romaine-token": _mint(signing_key, sub="svc:tank-operator:orchestrator")
-            },
-        )
-        assert r.status_code == 404
-
-
-def test_server_advertises_tools_list_changed():
-    # The MCP client only honours the surfacing notification if the server
-    # advertised tools.listChanged at initialize. build_app forces it True.
-    app = build_app(AzureBreakGlassGate(enforce=True))
-    # Find the FastMCP low-level server via the mounted streamable app and check
-    # the initialization options it would advertise.
-    from mcp.server.lowlevel.server import Server  # noqa: F401
-
-    # build_app patched create_initialization_options on the underlying server;
-    # reconstruct the same patch path by building a parallel server is overkill —
-    # instead assert via a fresh FastMCP that the patch yields listChanged True.
-    from mcp.server.fastmcp import FastMCP
-    from mcp.server.lowlevel.server import NotificationOptions
-
-    m = FastMCP("probe")
-    orig = m._mcp_server.create_initialization_options
-    m._mcp_server.create_initialization_options = (
-        lambda no=None, *a, **k: orig(no or NotificationOptions(tools_changed=True), *a, **k)
+    client = TestClient(_build_app(signing_key, gate))
+    r = client.post(
+        "/",
+        headers={
+            "x-auth-romaine-token": _mint(signing_key, actor_email="owner@example.com"),
+            "x-tank-caller-session-id": "941",
+        },
     )
-    opts = m._mcp_server.create_initialization_options()
-    assert opts.capabilities.tools is not None
-    assert opts.capabilities.tools.listChanged is True
+    assert r.status_code == 200
+
+
+def test_middleware_locked_allows_initialize_handshake(signing_key):
+    # Locked = connected-but-tool-less: initialize is synthesized so the MCP
+    # client connects cleanly (no error, no OAuth-trigger). A reconnect after a
+    # grant then re-runs the real handshake + lists the real tools.
+    client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=True)))
+    r = client.post(
+        "/",
+        headers={"x-tank-caller-session-id": "941"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "c", "version": "1"}},
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == 1
+    assert body["result"]["protocolVersion"] == "2025-06-18"
+    assert "tools" in body["result"]["capabilities"]
+    assert "error" not in body
+
+
+def test_middleware_locked_returns_empty_tools_list(signing_key):
+    client = TestClient(_build_app(signing_key, AzureBreakGlassGate(enforce=True)))
+    r = client.post(
+        "/",
+        headers={"x-tank-caller-session-id": "941"},
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == 2
+    assert body["result"]["tools"] == []
+    assert "error" not in body
