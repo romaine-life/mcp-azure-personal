@@ -28,7 +28,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+from threading import Lock
 
 import requests
 
@@ -95,6 +96,8 @@ class AzureBreakGlassGate:
         self._service_jwt = ""
         self._service_jwt_exp = 0.0
         self._grant_cache: dict[str, tuple[float, bool]] = {}
+        self._grant_cache_epoch: dict[str, int] = {}
+        self._grant_cache_lock = Lock()
 
     @classmethod
     def from_env(cls) -> "AzureBreakGlassGate":
@@ -137,20 +140,43 @@ class AzureBreakGlassGate:
         session_id = (session_id or "").strip()
         if not session_id:
             return False
-        try:
-            return self._active_grant(session_id)
-        except Exception as exc:  # network / exchange / parse — deny, briefly
-            log.warning("azure break-glass grant check failed for session %s: %s", session_id, exc)
-            self._grant_cache[session_id] = (time.monotonic() + self._cache_ttl, False)
+        return self._active_grant(session_id)
+
+    def invalidate_grant_cache(self, session_id: str) -> bool:
+        """Drop the cached grant decision for a Tank session.
+
+        Called by the orchestrator's grant-activated notification after it has
+        durably recorded an azure break-glass grant. Bumping the epoch prevents
+        a stale in-flight lookup from writing a pre-grant ``False`` back into
+        the cache after this invalidation lands.
+        """
+        session_id = (session_id or "").strip()
+        if not session_id:
             return False
+        with self._grant_cache_lock:
+            existed = self._grant_cache.pop(session_id, None) is not None
+            self._grant_cache_epoch[session_id] = self._grant_cache_epoch.get(session_id, 0) + 1
+            return existed
 
     def _active_grant(self, session_id: str) -> bool:
         now = time.monotonic()
-        cached = self._grant_cache.get(session_id)
-        if cached is not None and cached[0] > now:
-            return cached[1]
-        active = self._lookup_grant(session_id)
-        self._grant_cache[session_id] = (now + self._cache_ttl, active)
+        with self._grant_cache_lock:
+            cached = self._grant_cache.get(session_id)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            epoch = self._grant_cache_epoch.get(session_id, 0)
+
+        try:
+            active = self._lookup_grant(session_id)
+        except Exception as exc:  # network / exchange / parse — deny, briefly
+            log.warning("azure break-glass grant check failed for session %s: %s", session_id, exc)
+            active = False
+
+        expires_at = time.monotonic() + self._cache_ttl
+        with self._grant_cache_lock:
+            current_epoch = self._grant_cache_epoch.get(session_id, 0)
+            if current_epoch == epoch or active:
+                self._grant_cache[session_id] = (expires_at, active)
         return active
 
     def _lookup_grant(self, session_id: str) -> bool:

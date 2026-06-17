@@ -1,14 +1,15 @@
 """Tests for azure break-glass grant enforcement.
 
 Covers the gate's decision logic (exempt callers, missing JWT/session,
-active/inactive grants, caching, fail-closed) and the middleware that turns a
-denied decision into a 403 — wired behind the real CallerJWTMiddleware so the
-X-Auth-Romaine-Token header path is exercised end to end.
+active/inactive grants, caching, fail-closed), grant-activated cache
+invalidation, and the middleware that turns a denied decision into a
+JSON-RPC-shaped lock response wired behind the real CallerJWTMiddleware.
 """
 
 from __future__ import annotations
 
 import time
+from threading import Event, Thread
 
 import jwt
 import pytest
@@ -22,7 +23,7 @@ from starlette.testclient import TestClient
 
 from romaine_auth import CALLER, AuthRomaineLifeVerifier, Caller
 from mcp_azure_personal.grant import AzureBreakGlassGate
-from mcp_azure_personal.http import AzureBreakGlassMiddleware, CallerJWTMiddleware
+from mcp_azure_personal.http import AzureBreakGlassMiddleware, CallerJWTMiddleware, build_app
 
 
 @pytest.fixture(scope="module")
@@ -127,6 +128,56 @@ def test_gate_active_grant_allows_and_caches(monkeypatch):
     assert gate.allowed(_caller(), "941") is True
     assert gate.allowed(_caller(), "941") is True
     assert calls == ["941"]  # second call served from cache
+
+
+def test_gate_invalidate_cache_forces_next_lookup(monkeypatch):
+    gate = AzureBreakGlassGate(enforce=True)
+    active = {"value": False}
+    calls: list[str] = []
+
+    def lookup(sid):
+        calls.append(sid)
+        return active["value"]
+
+    monkeypatch.setattr(gate, "_lookup_grant", lookup)
+    assert gate.allowed(_caller(), "941") is False
+    assert gate.allowed(_caller(), "941") is False
+    assert calls == ["941"]
+
+    active["value"] = True
+    assert gate.invalidate_grant_cache("941") is True
+    assert gate.allowed(_caller(), "941") is True
+    assert calls == ["941", "941"]
+
+
+def test_gate_invalidate_blocks_stale_inflight_false_from_recaching(monkeypatch):
+    gate = AzureBreakGlassGate(enforce=True)
+    lookup_started = Event()
+    release_lookup = Event()
+    calls = 0
+
+    def lookup(_sid):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            lookup_started.set()
+            assert release_lookup.wait(timeout=2)
+            return False
+        return True
+
+    monkeypatch.setattr(gate, "_lookup_grant", lookup)
+    results: list[bool] = []
+    worker = Thread(target=lambda: results.append(gate.allowed(_caller(), "941")))
+    worker.start()
+    assert lookup_started.wait(timeout=2)
+
+    assert gate.invalidate_grant_cache("941") is False
+    release_lookup.set()
+    worker.join(timeout=2)
+    assert results == [False]
+
+    assert gate.allowed(_caller(), "941") is True
+    assert calls == 2
 
 
 def test_gate_inactive_grant_denies(monkeypatch):
@@ -251,3 +302,107 @@ def test_middleware_locked_returns_empty_tools_list(signing_key):
     assert body["id"] == 2
     assert body["result"]["tools"] == []
     assert "error" not in body
+
+
+# --- grant-activated cache invalidation route ---
+
+
+def test_grant_activated_invalidates_cached_locked_result(signing_key, monkeypatch):
+    gate = AzureBreakGlassGate(enforce=True)
+    active = {"value": False}
+    calls: list[str] = []
+
+    def lookup(sid):
+        calls.append(sid)
+        return active["value"]
+
+    monkeypatch.setattr(gate, "_lookup_grant", lookup)
+    assert gate.allowed(_caller(), "941") is False
+    assert gate.allowed(_caller(), "941") is False
+    assert calls == ["941"]
+
+    active["value"] = True
+    with TestClient(
+        build_app(
+            gate,
+            verifier=_verifier(signing_key),
+            grant_activated_principals=frozenset({"svc:tank-operator:orchestrator"}),
+        )
+    ) as client:
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "941"},
+            headers={
+                "x-auth-romaine-token": _mint(
+                    signing_key,
+                    sub="svc:tank-operator:orchestrator",
+                    actor_email="svc:tank-operator:orchestrator",
+                )
+            },
+        )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "cache_invalidated": True}
+
+    assert gate.allowed(_caller(), "941") is True
+    assert calls == ["941", "941"]
+
+
+def test_grant_activated_requires_session_id(signing_key):
+    with TestClient(
+        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
+    ) as client:
+        r = client.post(
+            "/internal/grant-activated",
+            json={},
+            headers={"x-auth-romaine-token": _mint(signing_key)},
+        )
+        assert r.status_code == 400
+        assert r.json()["ok"] is False
+
+
+def test_grant_activated_requires_jwt(signing_key):
+    with TestClient(
+        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
+    ) as client:
+        r = client.post("/internal/grant-activated", json={"session_id": "941"})
+        assert r.status_code == 401
+        assert r.json()["ok"] is False
+
+
+def test_grant_activated_rejects_non_service_role(signing_key):
+    with TestClient(
+        build_app(AzureBreakGlassGate(enforce=True), verifier=_verifier(signing_key))
+    ) as client:
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "941"},
+            headers={"x-auth-romaine-token": _mint(signing_key, role="user")},
+        )
+        assert r.status_code == 403
+        assert r.json()["ok"] is False
+
+
+def test_grant_activated_enforces_principal_allowlist(signing_key):
+    app = build_app(
+        AzureBreakGlassGate(enforce=True),
+        verifier=_verifier(signing_key),
+        grant_activated_principals=frozenset({"svc:tank-operator:orchestrator"}),
+    )
+    with TestClient(app) as client:
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "941"},
+            headers={"x-auth-romaine-token": _mint(signing_key, sub="other-service")},
+        )
+        assert r.status_code == 403
+        assert r.json()["ok"] is False
+
+        r = client.post(
+            "/internal/grant-activated",
+            json={"session_id": "941"},
+            headers={
+                "x-auth-romaine-token": _mint(signing_key, sub="svc:tank-operator:orchestrator")
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["ok"] is True

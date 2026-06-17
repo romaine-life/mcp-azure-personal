@@ -52,7 +52,8 @@ proxyResources:
 # Azure break-glass enforcement (tank-operator azure break-glass plan, stage 3).
 # enforce=true: the MCP surface is LOCKED — every request needs a valid
 # auth.romaine.life JWT plus an active Tank azure break-glass grant for the
-# caller's session, otherwise 403 (failure is closed). Both prerequisites are
+# caller's session, otherwise the MCP handshake stays connected with zero tools
+# and tool calls return a JSON-RPC locked error. Both prerequisites are
 # satisfied: mcp-azure-personal/mcp-azure-personal is in auth's
 # serviceSaAllowlist (the token exchange below works), and the only other
 # RoleBinding subject (Hermes) was retired, so no exemption is needed.
@@ -64,3 +65,7 @@ breakGlass:
   exemptSubjects: ""
   tankInternalUrl: http://tank-operator.tank-operator.svc.cluster.local
   exchangeUrl: https://auth.romaine.life/api/auth/exchange/k8s
+  # auth.romaine.life service principals (sub, actor_email, or email) allowed
+  # to POST /internal/grant-activated. Pinned to the tank-operator
+  # orchestrator, which fires it after an azure break-glass grant goes active.
+  grantActivatedPrincipals: svc:tank-operator:orchestrator

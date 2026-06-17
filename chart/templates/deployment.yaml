@@ -53,6 +53,12 @@ spec:
               value: "{{ .Values.breakGlass.exchangeUrl }}"
             - name: AUTH_ROMAINE_SA_TOKEN_FILE
               value: /var/run/secrets/auth.romaine.life/token
+            # auth.romaine.life service principals allowed to POST
+            # /internal/grant-activated. The endpoint only invalidates this
+            # process's short grant cache; the grant lookup remains the
+            # security boundary.
+            - name: AZURE_GRANT_ACTIVATED_PRINCIPALS
+              value: "{{ .Values.breakGlass.grantActivatedPrincipals }}"
           volumeMounts:
             - name: auth-romaine-sa-token
               mountPath: /var/run/secrets/auth.romaine.life
@@ -71,6 +77,9 @@ spec:
             - --insecure-listen-address=0.0.0.0:{{ .Values.proxy.port }}
             - --upstream=http://127.0.0.1:{{ .Values.upstreamPort }}/
             - --config-file=/etc/kube-rbac-proxy/config.yaml
+            # /internal/grant-activated is gated by the auth.romaine.life
+            # service JWT in the server, not by caller SA RBAC.
+            - --ignore-paths=/internal/grant-activated
             - --v=2
           ports:
             - name: proxy
