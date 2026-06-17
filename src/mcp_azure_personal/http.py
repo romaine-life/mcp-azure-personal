@@ -146,7 +146,7 @@ class AzureBreakGlassMiddleware(BaseHTTPMiddleware):
     so steady-state calls do not hit the network.
     """
 
-    _BYPASS_PATHS = frozenset({"/healthz"})
+    _BYPASS_PATHS = frozenset({"/healthz", "/internal/grant-activated"})
 
     def __init__(self, app, gate: AzureBreakGlassGate):
         super().__init__(app)
@@ -230,7 +230,11 @@ class AzureBreakGlassMiddleware(BaseHTTPMiddleware):
         )
 
 
-def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
+def build_app(
+    gate: AzureBreakGlassGate | None = None,
+    verifier: AuthRomaineLifeVerifier | None = None,
+    grant_activated_principals: frozenset[str] | None = None,
+) -> Starlette:
     mcp = FastMCP(
         "azure-personal-mcp",
         stateless_http=True,
@@ -260,17 +264,71 @@ def build_app(gate: AzureBreakGlassGate | None = None) -> Starlette:
     # broken JWKS URL, the first verify fails with 503 (handled in
     # CallerJWTMiddleware) and the absence of a JWT on subsequent
     # requests is tolerated.
-    verifier = default_verifier()
+    if verifier is None:
+        verifier = default_verifier()
     if gate is None:
         gate = AzureBreakGlassGate.from_env()
+    if grant_activated_principals is None:
+        grant_activated_principals = frozenset(
+            p.strip()
+            for p in os.environ.get("AZURE_GRANT_ACTIVATED_PRINCIPALS", "").split(",")
+            if p.strip()
+        )
     if gate.enforce:
         log.info("azure break-glass enforcement is ON; MCP surface requires an active grant")
     else:
         log.warning("azure break-glass enforcement is OFF; MCP surface is open")
 
+    async def grant_activated(request: Request) -> Response:
+        """Invalidate this session's grant cache after Tank records a grant.
+
+        This does not grant access and does not push MCP notifications. It only
+        clears azure-personal's short negative cache so the runner's next normal
+        reconnect/rebuild immediately re-reads the durable grant from
+        tank-operator.
+        """
+        caller = CALLER.get()
+        if caller is None:
+            return JSONResponse(
+                {"ok": False, "reason": "auth.romaine.life service JWT required"},
+                status_code=401,
+            )
+        if getattr(caller, "role", None) != "service":
+            return JSONResponse({"ok": False, "reason": "requires role=service"}, status_code=403)
+        if grant_activated_principals:
+            identities = {
+                (getattr(caller, "sub", "") or "").strip(),
+                (getattr(caller, "actor_email", "") or "").strip(),
+                (getattr(caller, "email", "") or "").strip(),
+            }
+            if not (identities & grant_activated_principals):
+                log.info(
+                    "grant-activated: rejected caller sub=%s (not an allowed principal)",
+                    getattr(caller, "sub", None),
+                )
+                return JSONResponse(
+                    {"ok": False, "reason": "caller not an allowed grant-activated principal"},
+                    status_code=403,
+                )
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        session_id = str((body or {}).get("session_id", "") or "").strip()
+        if not session_id:
+            return JSONResponse({"ok": False, "reason": "session_id required"}, status_code=400)
+        cache_invalidated = gate.invalidate_grant_cache(session_id)
+        log.info(
+            "grant-activated: invalidated grant cache for session %s",
+            session_id,
+            extra={"cache_entry_present": cache_invalidated},
+        )
+        return JSONResponse({"ok": True, "cache_invalidated": cache_invalidated})
+
     return Starlette(
         routes=[
             Route("/healthz", healthz),
+            Route("/internal/grant-activated", grant_activated, methods=["POST"]),
             Route("/", delete_session, methods=["DELETE"]),
             Mount("/", app=mcp.streamable_http_app()),
         ],

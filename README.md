@@ -24,15 +24,22 @@ header the mcp-auth-proxy injects, verifies the `X-Auth-Romaine-Token` JWT, and
 looks the grant up at tank-operator's
 `GET /api/internal/sessions/{id}/azure-break-glass/grant`, presenting its own
 `role=service` JWT minted from the projected `auth.romaine.life`-audience SA
-token. No grant ⇒ HTTP 403. The agent's path in is the Tank
+token. No grant ⇒ the MCP handshake stays connected with zero tools, and tool
+calls return a JSON-RPC locked error. The agent's path in is the Tank
 `request_azure_break_glass` MCP tool (records a request, returns an admin
 approval URL); see `romaine-life/tank-operator`
 `docs/features/session-lifecycle/capabilities.md` → "Locked-by-default Azure
 MCP".
 
+When Tank records a grant it also POSTs `/internal/grant-activated` with a
+service JWT. This endpoint does not grant access or push MCP notifications; it
+only clears the short per-session grant cache so the runner's normal
+reconnect/rebuild immediately observes the durable grant.
+
 Config (chart `values.yaml` → `breakGlass`): `enforce` (default `false` — ships
 inert), `exemptSubjects` (comma-separated JWT `sub`/`actor_email` allowlist for
-unattended automation such as Hermes), `tankInternalUrl`, `exchangeUrl`.
+unattended automation such as Hermes), `tankInternalUrl`, `exchangeUrl`,
+`grantActivatedPrincipals`.
 
 **Cutover order** (do not flip `enforce` to true before both): (1) `auth`
 allowlists this server's SA (`mcp-azure-personal/mcp-azure-personal`) in
